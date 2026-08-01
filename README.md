@@ -15,14 +15,18 @@ cargo add intyga-verify
 ## Verify an approval receipt
 
 ```rust
-use intyga_verify::{verify_approval_receipt_with_options, Expected, VerifyOptions};
+use intyga_verify::{verify_approval_receipt_with_options, ApproverTrustAnchor, Expected, VerifyOptions};
 use serde_json::json;
 
-// `expected` is what you are ABOUT to execute; `nonce` is the challenge YOU issued.
+// `expected` is what you are ABOUT to execute. `target` is YOUR OWN identifier (Target
+// Isolation), `nonce` is the challenge YOU issued, and `approvers` is the key set YOU trust —
+// all required, and none of them ever read from the receipt.
 let expected = Expected {
+    target: "prod-db-cluster-01".into(),
     nonce: nonce.clone(),
     action_type: "wipe_production".into(),
     params: json!({ "target": "prod-db-1" }),
+    approvers: ApproverTrustAnchor::PublicKeys(vec![approver_spki_b64]),
 };
 verify_approval_receipt_with_options(&receipt, &expected, &VerifyOptions::default())?;
 ```
@@ -49,19 +53,29 @@ verify_approval_receipt_with_options(&receipt, &expected, &opts)?;
 This port implements the **DEWP Core primitives** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1):
 domain-separated hashing (`0x00`/`0x01`/`0x02`/`0x03`), two-tier Merkle tree construction with
 duplicate-last balancing, leaf-to-root inclusion proof verification, the `trust.intyga.audit.v1`
-canonical preimage, and the `0x03` anchor digest. Byte parity with the TypeScript reference is locked
-by the shared golden vectors in `packages/mcp-schemas/vectors/ledger-vectors.json`.
+canonical preimage, the `0x03` anchor digest, and **anchor signature verification (single-anchor,
+ES256)** — `verify_anchor_signature`, over the raw 32-byte digest per §5.2. Byte parity with the
+TypeScript reference is locked by the shared golden vectors in
+`packages/mcp-schemas/vectors/ledger-vectors.json`, including the `signedAnchor` cases.
 
 It does **not** implement, and a caller should not assume:
 
-- **Anchor signature and quorum verification** (§5.3). `AnchorDigest` is provided; verifying an
-  anchor's signature and evaluating `requiredAnchors` / issuer trust is not. `anchorVerified` therefore
-  cannot be established by this port alone.
+- **Anchor quorum verification** (§5.3). A single anchor's ES256 signature can be checked with
+  `verify_anchor_signature` against a key the caller resolved; evaluating `requiredAnchors` /
+  issuer trust across multiple anchors, divergence detection, and non-ES256 anchor algorithms
+  (Ed25519, RSA-PSS) are not. `anchorVerified` beyond one ES256 anchor therefore cannot be
+  established by this port alone.
+- **The §5.4 checkpoint continuity chain** (`0x04` domain tag). TS-only; DEWP §9.1 places it
+  outside the Core Profile.
 - **Proof bundle parsing and the §7.1 verification levels.** This port verifies proofs, not envelopes.
 - **Evidence bundles, `tenantSeq` gapless validation, and NDJSON streaming** (§9.2 Extended Profile).
 
-For the Extended Profile — signed multi-anchor quorum, evidence bundles, gapless completeness and the
-four-property verification model — use the TypeScript verifier (`@intyga/verify`).
+For the rest of the surface — signed multi-anchor quorum, evidence bundles, gapless `tenantSeq`
+completeness over committed events, and the four-property verification model — use the TypeScript
+verifier (`@intyga/verify`). Note that no
+implementation, the TypeScript one included, currently claims the §9.2 **Extended Profile**: the
+profile also requires NDJSON evidence streaming (§6.4), which is specified but not yet implemented
+anywhere.
 
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
