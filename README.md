@@ -4,7 +4,7 @@ Independently confirm that a human cryptographically approved **exactly** the ac
 
 Depends only on the standard Rust crypto crates (`p256`, `sha2`, …) — no bespoke cryptography. Its canonicalization is held byte-identical to the TypeScript, Python, and Go verifiers by shared cross-language test vectors.
 
-> Status: **not yet published** to crates.io. Part of the Intyga multi-language verifier set.
+> Part of the Intyga multi-language verifier set (TypeScript, Python, Go, Rust).
 
 ## Add it
 
