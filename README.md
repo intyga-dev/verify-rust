@@ -75,6 +75,10 @@ It does **not** implement, and a caller should not assume:
   code is a human-factors aid that MUST NOT be treated as authentication, so this port carries
   `verificationCode` as an unvalidated field and deliberately does not assert those vectors
   (TypeScript and Python do).
+- **DIV §5b Agent Authority** (`div-agent-authority` payloads and the `agentAuthorityPayloads`
+  vector section). TypeScript-only. This port's approval verifier correctly REFUSES the
+  payload type — an authority authorizes no action — it just cannot verify one as governance
+  evidence.
 
 For the rest of the surface — signed multi-anchor quorum, evidence bundles, gapless `tenantSeq`
 completeness over committed events, and the four-property verification model — use the TypeScript
