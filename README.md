@@ -91,6 +91,7 @@ anywhere.
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
 - Python — [`verify-python`](https://github.com/intyga-dev/verify-python)
 - Go — [`verify-go`](https://github.com/intyga-dev/verify-go)
+- Java — [`verify-java`](https://github.com/intyga-dev/verify-java)
 
 For a full client that *requests* approvals (not just verifies them), see [`sdk-rust`](https://github.com/intyga-dev/sdk-rust) — it bundles this verifier, so you don't need both.
 
