@@ -5,7 +5,7 @@ All notable changes to `intyga-verify` (Rust) are documented here. The format fo
 
 ## [Unreleased]
 
-## [0.1.0]
+## [1.0.0]
 
 Initial public release.
 
