@@ -2,9 +2,9 @@
 
 Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no Intyga secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
 
-Depends only on the standard Rust crypto crates (`p256`, `sha2`, …) — no bespoke cryptography. Its canonicalization is held byte-identical to the TypeScript, Python, and Go verifiers by shared cross-language test vectors.
+Depends only on the standard Rust crypto crates (`p256`, `sha2`, …) — no bespoke cryptography. Its canonicalization is held byte-identical to the TypeScript, Python, Go, and Java verifiers by shared cross-language test vectors, for portable content (DIV §4.1.1). One known exception inside the portable range: an integer in `(2^53, 1e16)` canonicalizes to its exact digits here, as it does in Java and Python, while a double-based parser (TypeScript, Go) rounds it at parse time — the same document then yields different bytes and the mismatch reads as tampering. Keep integers within `±2^53` or carry larger values as decimal strings.
 
-> Part of the Intyga multi-language verifier set (TypeScript, Python, Go, Rust).
+> Part of the Intyga multi-language verifier set (TypeScript, Python, Go, Rust, Java).
 
 ## Add it
 
@@ -31,7 +31,7 @@ let expected = Expected {
 verify_approval_receipt_with_options(&receipt, &expected, &VerifyOptions::default())?;
 ```
 
-**One-approver-per-key caveat.** In `PublicKeys` mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. For `requiredApprovals` > 1 use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
+**One-approver-per-key caveat.** In `PublicKeys` mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. The same limitation weakens `requesterCannotApprove`: the witness's `signerDid` is an unverified string in this mode, so a requester holding a listed key can evade the four-eyes exclusion by naming a different `signerDid`. For `requiredApprovals` > 1 — or whenever four-eyes matters — use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
 
 `verify_approval_receipt(&receipt, &expected)` is a shorthand for ES256 receipts. One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -54,7 +54,8 @@ verify_approval_receipt_with_options(&receipt, &expected, &opts)?;
 
 This port implements the **DEWP Core primitives** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1):
 domain-separated hashing (`0x00`/`0x01`/`0x02`/`0x03`), two-tier Merkle tree construction with
-duplicate-last balancing, leaf-to-root inclusion proof verification, the `trust.intyga.audit.v1`
+duplicate-last balancing, leaf-to-root inclusion proof verification **bounded by leaf position**
+(§11.1 — range, path length, and self-pairing all checked), the `trust.intyga.audit.v1`
 canonical preimage, the `0x03` anchor digest, and **anchor signature verification (single-anchor,
 ES256)** — `verify_anchor_signature`, over the raw 32-byte digest per §5.2. Byte parity with the
 TypeScript reference is locked by the shared golden vectors in
@@ -79,6 +80,11 @@ It does **not** implement, and a caller should not assume:
   vector section). TypeScript-only. This port's approval verifier correctly REFUSES the
   payload type — an authority authorizes no action — it just cannot verify one as governance
   evidence.
+- **DIV §5c Platform Hash-Only Intent** (`div-platform-intent` payloads and the
+  `platformIntentPayloads` vector section). TypeScript-only. This port's approval verifier
+  correctly REFUSES the payload type (pinned by the `platform-intent-refused-by-approval-verifier`
+  receipt fixture) — §5c requires a separate `verifyPlatformReceipt` entry point — it just cannot
+  verify one.
 
 For the rest of the surface — signed multi-anchor quorum, evidence bundles, gapless `tenantSeq`
 completeness over committed events, and the four-property verification model — use the TypeScript
