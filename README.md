@@ -28,10 +28,13 @@ let expected = Expected {
     params: json!({ "target": "prod-db-1" }),
     approvers: ApproverTrustAnchor::PublicKeys(vec![approver_spki_b64]),
 };
-verify_approval_receipt_with_options(&receipt, &expected, &VerifyOptions::default())?;
+// On success you get the DISTINCT approver identities whose signatures verified, sorted — the
+// keys themselves in `PublicKeys` mode, the DIDs in identity mode. Empty for an AUTO_APPROVED
+// receipt, because no human signed it.
+let signers = verify_approval_receipt_with_options(&receipt, &expected, &VerifyOptions::default())?;
 ```
 
-**One-approver-per-key caveat.** In `PublicKeys` mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. The same limitation weakens `requesterCannotApprove`: the witness's `signerDid` is an unverified string in this mode, so a requester holding a listed key can evade the four-eyes exclusion by naming a different `signerDid`. For `requiredApprovals` > 1 — or whenever four-eyes matters — use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
+**One-approver-per-key caveat.** In `PublicKeys` mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. A signed `requesterCannotApprove` rule requires DID/identity trust; key-only anchors are refused because `signerDid` is unverified in that mode. For `requiredApprovals` > 1, use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
 
 `verify_approval_receipt(&receipt, &expected)` is a shorthand for ES256 receipts. One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -50,48 +53,42 @@ verify_approval_receipt_with_options(&receipt, &expected, &opts)?;
 
 `require_user_verification` defaults to true (demands the User-Verified flag); set `Some(false)` to accept mere user presence. Policy `AUTO_APPROVED` receipts carry no human signature and fail closed unless you opt in with `allow_auto_approved: true`.
 
-## DEWP conformance
+## Receipt and audit verification
 
-This port implements the **DEWP Core primitives** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1):
-domain-separated hashing (`0x00`/`0x01`/`0x02`/`0x03`), two-tier Merkle tree construction with
-duplicate-last balancing, leaf-to-root inclusion proof verification **bounded by leaf position**
-(§11.1 — range, path length, and self-pairing all checked), the `trust.intyga.audit.v1`
-canonical preimage, the `0x03` anchor digest, and **anchor signature verification (single-anchor,
-ES256)** — `verify_anchor_signature`, over the raw 32-byte digest per §5.2. Byte parity with the
-TypeScript reference is locked by the shared golden vectors in
-`packages/mcp-schemas/vectors/ledger-vectors.json`, including the `signedAnchor` cases.
+Use `verify_platform_receipt` and `verify_agent_authority` for the additional DIV receipt types.
+`bundle::verify_bundle` verifies single proofs; `bundle::verify_evidence_bundle_with_options`
+adds caller-policy anchoring to multi-event exports. The existing `verify_evidence_bundle` entry
+point remains available for callers that only pin roots. Supply `EvidenceAnchorSet::ByCheckpoint`
+for checkpoint-attributed caller anchors, or `Flat` for a flat candidate list.
+`chain::verify_roots_chain` checks continuity; `ledger::verify_signed_anchor` supports all three
+anchor signature algorithms, while the existing `verify_anchor_signature` ES256 helper remains.
 
-It does **not** implement, and a caller should not assume:
+The five language verifiers support the same receipt and audit verification features, pinned by
+`canonical-vectors.json`, `ledger-vectors.json` and `verifier-parity-vectors.json`:
 
-- **Anchor quorum verification** (§5.3). A single anchor's ES256 signature can be checked with
-  `verify_anchor_signature` against a key the caller resolved; evaluating `requiredAnchors` /
-  issuer trust across multiple anchors, divergence detection, and non-ES256 anchor algorithms
-  (Ed25519, RSA-PSS) are not. `anchorVerified` beyond one ES256 anchor therefore cannot be
-  established by this port alone.
-- **The §5.4 checkpoint continuity chain** (`0x04` domain tag). TS-only; DEWP §9.1 places it
-  outside the Core Profile.
-- **Proof bundle parsing and the §7.1 verification levels.** This port verifies proofs, not envelopes.
-- **Evidence bundles, `tenantSeq` gapless validation, and NDJSON streaming** (§9.2 Extended Profile).
-- **DIV §4.4.4 verification-code derivation** (the `digests` vector section). The short display
-  code is a human-factors aid that MUST NOT be treated as authentication, so this port carries
-  `verificationCode` as an unvalidated field and deliberately does not assert those vectors
-  (TypeScript and Python do).
-- **DIV §5b Agent Authority** (`div-agent-authority` payloads and the `agentAuthorityPayloads`
-  vector section). TypeScript-only. This port's approval verifier correctly REFUSES the
-  payload type — an authority authorizes no action — it just cannot verify one as governance
-  evidence.
-- **DIV §5c Platform Hash-Only Intent** (`div-platform-intent` payloads and the
-  `platformIntentPayloads` vector section). TypeScript-only. This port's approval verifier
-  correctly REFUSES the payload type (pinned by the `platform-intent-refused-by-approval-verifier`
-  receipt fixture) — §5c requires a separate `verifyPlatformReceipt` entry point — it just cannot
-  verify one.
+- DIV approval/offline/delegation receipts, agent-authority seals (§5b), and platform receipts (§5c).
+  Platform receipts require WebAuthn and caller-pinned digest, RP, nonce, origin and subject keys.
+  Authority/delegation verification never substitutes for approval of an action.
+- Self-certifying DIDs, with explicit caller key mappings taking precedence.
+- DEWP single-event and multi-event proof bundles: inclusion, canonical content/header binding,
+  embedded ES256 signatures, tenant identity, sequence gaps/duplicates and claimed range endpoints.
+- Checkpoint continuity (§5.4), and anchor quorum (§5.3) under the caller's policy: ES256, Ed25519,
+  RSA-PSS and Rekor SET/payload verification under a separately pinned log key.
 
-For the rest of the surface — signed multi-anchor quorum, evidence bundles, gapless `tenantSeq`
-completeness over committed events, and the four-property verification model — use the TypeScript
-verifier (`@intyga/verify`). Note that no
-implementation, the TypeScript one included, currently claims the §9.2 **Extended Profile**: the
-profile also requires NDJSON evidence streaming (§6.4), which is specified but not yet implemented
-anywhere.
+Trust inputs must come from the caller. A root carried in the bundle proves only internal
+consistency; a producer's `externallyAnchored` flag is a claim, not verification. Bundle-carried
+anchors can count under caller-trusted keys, but only independently fetched, checkpoint-attributed
+anchors may establish divergence. For multi-checkpoint exports, key caller anchors by checkpoint ID
+or root; a flat list cannot establish exact attribution across checkpoints.
+
+Limits remain explicit: no NDJSON evidence streaming, no RFC 3161/CMS verification, and no WEBHOOK
+anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
+DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
+full DIV receipt separately. Offline authority verification checks the seal, not subsequent online
+revocation. Verification does not consume a nonce or prove execution.
+
+The short DIV display-code derivation and document-signing canonical builder remain outside this
+port's API; neither is used to authenticate a receipt. Portable-number limits are unchanged.
 
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
