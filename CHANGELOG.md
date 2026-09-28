@@ -5,6 +5,60 @@ All notable changes to `intyga-verify` (Rust) are documented here. The format fo
 
 ## [Unreleased]
 
+- **DIV/DEWP 1.0 pre-release correction (2026-09-27 review L15-L18, I7, I8):** signed timestamps use one
+  strict RFC 3339 grammar (the parser accepted lowercase `t`/`z`, a comma fraction, any number of
+  fraction digits, `:60` and day 31 of every month). A WebAuthn `topOrigin` differing from `origin`
+  is refused. `verify_platform_receipt` ignores `require_user_verification: Some(false)`. A key
+  mapped to two DIDs counts once toward a quorum. RSA-PSS anchors require a 32-byte salt and a
+  2048-bit modulus (the salt used to be recovered from the signature). Divergence evidence is held
+  to the quorum's seq-range and witness-time rules; a Rekor entry establishes divergence only with
+  submitter keys pinned. Pinned in all five languages by the `verifierInputHardening` parity vectors; no canonical bytes change for valid input.
+- **Breaking (DIV 1.0 pre-release correction, H1):** `Expected` and `AgentAuthorityExpectation` gain
+  `requirement: Option<RequirementFloor>`, applied by `verify_approval_receipt*`, `verify_delegation`
+  and `verify_agent_authority`; existing struct literals need `requirement: None`. Export
+  `WEAKER_REQUIREMENT_REASON`. The signed `requirement` is authored by the signers, so one approver
+  (possibly the requester) could self-compose a 1-of-1 receipt for a 3-of-3 four-eyes action and it
+  verified. A weaker signed requirement is now refused before any signature is counted when the caller
+  supplies its own rule (DIV §5 step 3d), on approval, offline, delegation and agent-authority
+  verification; the reason starts "signed requirement is weaker than the relying party's policy".
+  Omitting the floor keeps the previous behaviour, which proves only the quorum the signers stated. No
+  signed byte changes; shared parity vectors pin it in all five languages.
+- **DEWP evidence verification (1.0 pre-release correction, Sep 2026):** an entry with a canonical
+  preimage reads `tenantSeq` only from it (null ⇒ no counter) and fails when its redaction counter
+  disagrees; a tenant-bound entry fails when the bundle declares no tenant (`tenant` may now be
+  absent); a preimage under an unknown profile fails; repeated leaves/seqs and inconsistent leaf
+  counts fail; a checkpoint with no `chain_hash`/`anchored_at` is never anchored. New
+  `EvidenceVerifyOptions::trusted_checkpoints` and `BundleVerifyOptions::trusted_checkpoint`
+  (`ledger::TrustedCheckpoint`) take caller-held roots-file records; a single proof counts a
+  Rekor/TSA anchor only against one. `SignedAnchor::is_well_formed` requires a registered algorithm.
+  Pinned by the shared `dewpEvidenceHardening` vectors.
+- **DIV 1.0 pre-release correction (PK-11):** under a signed `requireHardwareKey`, a WEBAUTHN witness
+  whose signed authenticatorData carries the Backup Eligible or Backup State flag no longer counts
+  toward the quorum (DIV §4.4.5 rule 6) — a relying party now catches an issuer that let a synced
+  passkey sign a hardware-pinned action. No signed byte changes; shared parity vectors pin it in all
+  five languages.
+- **Breaking (DEWP 1.0 pre-release correction):** the anchored preimage is now
+  `[dailyRoot, timestamp, issuer, algorithm, seqStart, seqEnd, chainHash]`; anchors lacking the
+  position fields never verify. External witness times (Rekor `integratedTime`, TSA `genTime`) must
+  fall within `maxAnchorLagSeconds` (default 86400) after — or 300 s before — the checkpoint's claimed
+  time; anchors must match the checkpoint's seq range, chain hash and `anchoredAt`; evidence-bundle
+  chain hashes are recomputed; verdicts expose per-issuer witness times; an optional pinned Rekor
+  submitter key is enforced. A supplied root is reported as `rootSource: "caller-supplied"` (was
+  `"independent"`).
+- A non-empty `allowedAaguids` is refused exactly like `requireHardwareKey`: bare-key witnesses do not
+  count and offline proofs are rejected (DIV §4.3.2/§5a.3).
+
+- Add opt-in RFC 3161/CMS verification and quorum/divergence integration through an isolated
+  OpenSSL 3 adapter with signer-certificate pinning and explicit CRL or unchecked revocation.
+- Bind Rekor trust to `rekor_issuer` for multi-issuer policies so one log cannot impersonate several
+  quorum identities; legacy unscoped keys remain valid only for single-issuer policies.
+
+- Enforce DIV §5 identity trust for multi-approver quorums; preserve DIV §4.4.2 ES256
+  compatibility for absent/null/unknown witness labels, while refusing AUTO_APPROVED witnesses.
+- Validate DEWP protocol, version and declared hash/serialization/Merkle algorithms before
+  accepting proof or evidence bundles. Legacy numeric revisions 1/2 remain supported without
+  a protocol declaration. Shared cross-language fixtures cover these contracts.
+
 - **Wire format: DIV v1 agent intents now sign `action`, `agent`, `session`, `nbf`, and `exp` instead of ordinary `expiresAt`; `div-agent-authority` requires `parentReceiptHash` (null for a root).** Older §5b seals lacking that key cannot verify under this pre-release profile and must be re-sealed. All canonical producers, five verifier ports and vectors must move together; the ordinary HUMAN/SERVICE intent keeps `expiresAt`.
 
 - **Wire format: the DIV Intent Payload gained a REQUIRED `evidence` field, and it must be `null`.**

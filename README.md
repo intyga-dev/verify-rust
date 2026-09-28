@@ -31,10 +31,33 @@ let expected = Expected {
 // On success you get the DISTINCT approver identities whose signatures verified, sorted — the
 // keys themselves in `PublicKeys` mode, the DIDs in identity mode. Empty for an AUTO_APPROVED
 // receipt, because no human signed it.
-let signers = verify_approval_receipt_with_options(&receipt, &expected, &VerifyOptions::default())?;
+// REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP ID,
+// from the trust-anchor file exported in the console (its `webauthn` block).
+let opts = VerifyOptions {
+    expected_origin: std::env::var("INTYGA_WEBAUTHN_ORIGIN").ok(),
+    expected_rp_id: std::env::var("INTYGA_WEBAUTHN_RP_ID").ok(),
+    ..Default::default()
+};
+let signers = verify_approval_receipt_with_options(&receipt, &expected, &opts)?;
 ```
 
-**One-approver-per-key caveat.** In `PublicKeys` mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. A signed `requesterCannotApprove` rule requires DID/identity trust; key-only anchors are refused because `signerDid` is unverified in that mode. For `requiredApprovals` > 1, use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
+**Quorum trust.** Key-only trust is accepted only for a one-approval requirement without
+`requesterCannotApprove`. Multi-approver quorums and separation of duties require a DID/identity
+anchor and otherwise fail closed (DIV §5 step 3b). Several credentials for one DID count as one
+approver. Delegations require identity trust regardless of quorum size.
+
+**Requirement floor (DIV §5 step 3d).** The signed `requirement` is the signers' own statement: its
+signature stops a third party from altering it, not the approvers it constrains from writing a weaker
+one. One approver who is also the requester can sign a 1-of-1 payload alone. **Without a floor this
+verifier proves only the quorum the signers stated.** When you know the rule, set
+`Expected { requirement: Some(RequirementFloor { required_approvals: 3, requester_cannot_approve: true, require_hardware_key: false }), .. }`
+(`AgentAuthorityExpectation::requirement` for seals). `None` keeps the previous behaviour; the field
+is new, so existing struct literals need `requirement: None`.
+A signed requirement weaker on any field — fewer approvals, no four-eyes or no hardware key where the
+floor demands one — is refused before any signature is counted, with a reason starting "signed
+requirement is weaker than the relying party's policy"; an equal or stricter one passes. A malformed
+floor (quorum below 1) is refused rather than ignored. The same field exists on the delegation
+expectation (pass the ordinary rule) and the agent-authority expectation (your sealing policy).
 
 `verify_approval_receipt(&receipt, &expected)` is a shorthand for ES256 receipts. One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -51,7 +74,7 @@ let opts = VerifyOptions {
 verify_approval_receipt_with_options(&receipt, &expected, &opts)?;
 ```
 
-`require_user_verification` defaults to true (demands the User-Verified flag); set `Some(false)` to accept mere user presence. Policy `AUTO_APPROVED` receipts carry no human signature and fail closed unless you opt in with `allow_auto_approved: true`.
+`require_user_verification` defaults to true (demands the User-Verified flag); set `Some(false)` to accept mere user presence (`verify_platform_receipt` ignores it: DIV §5c.3 requires user verification unconditionally). Policy `AUTO_APPROVED` receipts carry no human signature and fail closed unless you opt in with `allow_auto_approved: true`.
 
 ## Receipt and audit verification
 
@@ -73,7 +96,10 @@ The five language verifiers support the same receipt and audit verification feat
 - DEWP single-event and multi-event proof bundles: inclusion, canonical content/header binding,
   embedded ES256 signatures, tenant identity, sequence gaps/duplicates and claimed range endpoints.
 - Checkpoint continuity (§5.4), and anchor quorum (§5.3) under the caller's policy: ES256, Ed25519,
-  RSA-PSS and Rekor SET/payload verification under a separately pinned log key.
+  RSA-PSS, Rekor SET/payload verification, and opt-in RFC 3161/CMS verification.
+
+Set `ExternalAnchorKeys::rekor_issuer` whenever a policy trusts multiple issuers. Legacy unscoped
+Rekor trust is accepted only when the policy has one unique trusted issuer.
 
 Trust inputs must come from the caller. A root carried in the bundle proves only internal
 consistency; a producer's `externallyAnchored` flag is a claim, not verification. Bundle-carried
@@ -81,8 +107,14 @@ anchors can count under caller-trusted keys, but only independently fetched, che
 anchors may establish divergence. For multi-checkpoint exports, key caller anchors by checkpoint ID
 or root; a flat list cannot establish exact attribution across checkpoints.
 
-Limits remain explicit: no NDJSON evidence streaming, no RFC 3161/CMS verification, and no WEBHOOK
-anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
+RFC 3161 anchors count only with issuer-specific `ExternalAnchorKeys::rfc3161` trust and OpenSSL 3.
+`rfc3161::verify_rfc3161_anchor` isolates OpenSSL from host trust and network fetching, pins the
+signer certificate, and requires offline CRL checking or explicit `unchecked` revocation.
+CMS signer digests are restricted to SHA-256, SHA-384, or SHA-512. `verification_time` is
+caller-selected; its default rounds up by at most one second for fresh
+fractional timestamps. Historical results depend on retained CA, intermediate, and CRL material.
+Limits remain explicit: no NDJSON evidence streaming and no WEBHOOK anchor verifier. WEBHOOK anchors
+do not count toward quorum. No implementation claims the complete
 DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
 full DIV receipt separately. Offline authority verification checks the seal, not subsequent online
 revocation. Verification does not consume a nonce or prove execution.
