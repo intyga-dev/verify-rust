@@ -5,6 +5,10 @@ All notable changes to `intyga-verify` (Rust) are documented here. The format fo
 
 ## [Unreleased]
 
+- Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
+  Report explicit per-event signature status and key trust; add strict signature acceptance for
+  single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
+
 - **DIV/DEWP 1.0 pre-release correction (2026-09-27 review L15-L18, I7, I8):** signed timestamps use one
   strict RFC 3339 grammar (the parser accepted lowercase `t`/`z`, a comma fraction, any number of
   fraction digits, `:60` and day 31 of every month). A WebAuthn `topOrigin` differing from `origin`
