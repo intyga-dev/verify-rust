@@ -1,10 +1,10 @@
-# intyga-verify — Offline Intyga receipt verification for Rust
+# intyga-verify — Offline INTYGA receipt verification for Rust
 
-Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no Intyga secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
+Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no INTYGA secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
 
 Depends only on the standard Rust crypto crates (`p256`, `sha2`, …) — no bespoke cryptography. Its canonicalization is held byte-identical to the TypeScript, Python, Go, and Java verifiers by shared cross-language test vectors, for portable content (DIV §4.1.1). One known exception inside the portable range: an integer in `(2^53, 1e16)` canonicalizes to its exact digits here, as it does in Java and Python, while a double-based parser (TypeScript, Go) rounds it at parse time — the same document then yields different bytes and the mismatch reads as tampering. Keep integers within `±2^53` or carry larger values as decimal strings.
 
-> Part of the Intyga multi-language verifier set (TypeScript, Python, Go, Rust, Java).
+> Part of the INTYGA multi-language verifier set (TypeScript, Python, Go, Rust, Java).
 
 ## Add it
 

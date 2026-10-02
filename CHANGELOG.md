@@ -5,6 +5,8 @@ All notable changes to `intyga-verify` (Rust) are documented here. The format fo
 
 ## [Unreleased]
 
+## [1.0.0]
+
 - Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
   Report explicit per-event signature status and key trust; add strict signature acceptance for
   single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
@@ -101,12 +103,11 @@ All notable changes to `intyga-verify` (Rust) are documented here. The format fo
   `requiredApprovals`" is satisfied vacuously by 0, so the minimum is now enforced explicitly
   instead of by an undocumented floor.
 
-## [1.0.0]
 
 Initial public release.
 
 - Offline approval-receipt verification (ES256 and WebAuthn) against a caller-supplied trust
-  anchor — no Intyga secret, no network. Standard Rust crypto crates (`p256`, `sha2`, …), no
+  anchor — no INTYGA secret, no network. Standard Rust crypto crates (`p256`, `sha2`, …), no
   bespoke cryptography.
 - DEWP Core Profile primitives and §5.2 single-anchor signature verification, pinned by the shared
   cross-language golden vectors. §5.3 anchor-quorum evaluation and evidence-bundle parsing are
