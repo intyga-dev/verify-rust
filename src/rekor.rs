@@ -53,7 +53,10 @@ pub fn verify_rekor_anchor(
 /// base64 of the PEM text.
 fn submitted_by_pinned_key(v: &serde_json::Value, a: &SignedAnchor, pinned: &[String]) -> bool {
     let sig = &v["spec"]["signature"];
-    let (Some(pk_b64), Some(sig_b64)) = (sig["publicKey"]["content"].as_str(), sig["content"].as_str()) else {
+    let (Some(pk_b64), Some(sig_b64)) = (
+        sig["publicKey"]["content"].as_str(),
+        sig["content"].as_str(),
+    ) else {
         return false;
     };
     let Some(submitted) = STANDARD
@@ -64,10 +67,16 @@ fn submitted_by_pinned_key(v: &serde_json::Value, a: &SignedAnchor, pinned: &[St
     else {
         return false;
     };
-    if !pinned.iter().any(|k| decode_public_key(k).as_deref() == Some(submitted.as_slice())) {
+    if !pinned
+        .iter()
+        .any(|k| decode_public_key(k).as_deref() == Some(submitted.as_slice()))
+    {
         return false;
     }
-    let (Some(key), Ok(sig_bytes)) = (crate::parse_p256_public_key(&submitted), STANDARD.decode(sig_b64)) else {
+    let (Some(key), Ok(sig_bytes)) = (
+        crate::parse_p256_public_key(&submitted),
+        STANDARD.decode(sig_b64),
+    ) else {
         return false;
     };
     crate::verify_p256_signature(&key, &a.digest(), &sig_bytes)

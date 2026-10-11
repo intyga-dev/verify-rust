@@ -29,6 +29,8 @@ let expected = Expected {
     action_type: "wipe_production".into(),
     params: json!({ "target": "prod-db-1" }),
     approvers: ApproverTrustAnchor::PublicKeys(vec![approver_spki_b64]),
+    // Independently resolved from this relying party's tenant configuration; never from receipt.
+    tenant_id: Some(std::env::var("INTYGA_TENANT_ID")?),
 };
 // On success you get the DISTINCT approver identities whose signatures verified, sorted — the
 // keys themselves in `PublicKeys` mode, the DIDs in identity mode. Empty for an AUTO_APPROVED

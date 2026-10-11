@@ -62,7 +62,10 @@ fn shared_verifier_input_hardening_receipts() {
     let section = &vectors["verifierInputHardening"];
     let keys = key_table(&section["keys"]);
     for part in ["approvals", "platform", "agentAuthority"] {
-        assert!(!section[part]["cases"].as_array().unwrap().is_empty(), "{part}");
+        assert!(
+            !section[part]["cases"].as_array().unwrap().is_empty(),
+            "{part}"
+        );
     }
     run_approval_cases(&section["approvals"], &keys);
     run_platform_cases(&section["platform"], &keys);
@@ -86,14 +89,43 @@ fn run_approval_cases(section: &Value, keys: &BTreeMap<String, Value>) {
         } else {
             "spkiB64"
         };
-        let expected = Expected {
-            // DIV §5 step 3d: an optional relying-party requirement floor.
-            requirement: floor(&e["requirement"]),
-            target: e["target"].as_str().unwrap().into(),
-            nonce: e["nonce"].as_str().unwrap().into(),
-            action_type: e["actionType"].as_str().unwrap().into(),
-            params: e["params"].clone(),
-            approvers: ApproverTrustAnchor::PublicKeys(
+        let approvers = if let Some(table) = e["approverDids"].as_object() {
+            let cose_dids = e["approverCoseDids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>();
+            let resolved = table
+                .iter()
+                .map(|(did, ids)| {
+                    let encoding = if cose_dids.contains(did) {
+                        "coseB64"
+                    } else {
+                        "spkiB64"
+                    };
+                    let values = ids
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| {
+                            keys[id.as_str().unwrap()][encoding]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        })
+                        .collect::<Vec<_>>();
+                    (did.clone(), values)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let dids = resolved.keys().cloned().collect::<Vec<_>>();
+            ApproverTrustAnchor::DidsMultiKey {
+                dids,
+                resolve: Box::new(move |did| resolved.get(did).cloned().unwrap_or_default()),
+            }
+        } else {
+            ApproverTrustAnchor::PublicKeys(
                 e["approverKeyIds"]
                     .as_array()
                     .unwrap()
@@ -105,7 +137,18 @@ fn run_approval_cases(section: &Value, keys: &BTreeMap<String, Value>) {
                             .to_owned()
                     })
                     .collect(),
-            ),
+            )
+        };
+        let expected = Expected {
+            // DIV §5 step 3d: an optional relying-party requirement floor.
+            requirement: floor(&e["requirement"]),
+            target: e["target"].as_str().unwrap().into(),
+            nonce: e["nonce"].as_str().unwrap().into(),
+            action_type: e["actionType"].as_str().unwrap().into(),
+            params: e["params"].clone(),
+            requester_did: None,
+            approvers,
+            tenant_id: None,
         };
         let receipt: ApprovalReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
         let opts = options(&merged(&section["options"], &case["options"]));
@@ -163,6 +206,7 @@ fn run_platform_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             rp_id: e["rpId"].as_str().unwrap().into(),
             nonce: e["nonce"].as_str().unwrap().into(),
             subject_external_id: e["subjectExternalId"].as_str().map(str::to_owned),
+            tenant_id: None,
         };
         let receipt: PlatformReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
         let result = verify_platform_receipt(
@@ -232,6 +276,7 @@ fn run_authority_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             target: e["target"].as_str().unwrap().into(),
             agent_did: e["agentDid"].as_str().unwrap().into(),
             requirement: floor(&e["requirement"]),
+            tenant_id: None,
         };
         let receipt: ApprovalReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
         let result = verify_agent_authority(
@@ -270,6 +315,239 @@ fn run_authority_cases(section: &Value, keys: &BTreeMap<String, Value>) {
     }
 }
 
+fn tenant_expected(
+    raw: &Value,
+    keys: &BTreeMap<String, Value>,
+    tenant_id: Option<&str>,
+) -> Expected {
+    let anchor = if let Some(ids) = raw["approverKeyIds"].as_array() {
+        ApproverTrustAnchor::PublicKeys(
+            ids.iter()
+                .map(|id| {
+                    keys[id.as_str().unwrap()]["spkiB64"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect(),
+        )
+    } else {
+        let mappings: BTreeMap<String, Vec<String>> = raw["approverDids"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(did, ids)| {
+                (
+                    did.clone(),
+                    ids.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| {
+                            keys[id.as_str().unwrap()]["spkiB64"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        ApproverTrustAnchor::DidsMultiKey {
+            dids: mappings.keys().cloned().collect(),
+            resolve: Box::new(move |did| mappings.get(did).cloned().unwrap_or_default()),
+        }
+    };
+    Expected {
+        target: raw["target"].as_str().unwrap_or_default().into(),
+        nonce: raw["nonce"].as_str().unwrap_or_default().into(),
+        action_type: raw["actionType"].as_str().unwrap_or_default().into(),
+        params: raw.get("params").cloned().unwrap_or(Value::Null),
+        requester_did: raw["requesterDid"].as_str().map(str::to_owned),
+        approvers: anchor,
+        requirement: floor(&raw["requirement"]),
+        tenant_id: tenant_id.map(str::to_owned),
+    }
+}
+
+fn tenant_authority_expected(
+    raw: &Value,
+    keys: &BTreeMap<String, Value>,
+    tenant_id: Option<&str>,
+) -> AgentAuthorityExpectation {
+    let expected = tenant_expected(raw, keys, tenant_id);
+    AgentAuthorityExpectation {
+        approvers: expected.approvers,
+        target: expected.target,
+        agent_did: raw["agentDid"].as_str().unwrap_or_default().into(),
+        requirement: expected.requirement,
+        tenant_id: expected.tenant_id,
+    }
+}
+
+#[test]
+fn shared_tenant_binding_verifier_vectors() {
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vectors/tenant-binding-vectors.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let keys = key_table(&vectors["keys"]);
+    for case in vectors["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let verifier = case["verifier"].as_str().unwrap();
+        let mut opts = options(&case["options"]);
+        let tenant = case["expectedTenantId"].as_str();
+        let result = match verifier {
+            "approval" => {
+                if let Some(links) = case["chain"].as_array() {
+                    let chain: Vec<AgentAuthorityChainLink> = links
+                        .iter()
+                        .map(|link| AgentAuthorityChainLink {
+                            receipt: serde_json::from_value(link["receipt"].clone()).unwrap(),
+                            expected: tenant_authority_expected(
+                                &link["expected"],
+                                &keys,
+                                link["expectedTenantId"].as_str(),
+                            ),
+                        })
+                        .collect();
+                    opts.agent_authority_chain = Some(std::sync::Arc::new(chain));
+                }
+                let receipt: ApprovalReceipt =
+                    serde_json::from_value(case["receipt"].clone()).unwrap();
+                let expected = tenant_expected(&case["expected"], &keys, tenant);
+                if let Some(agent_context) = case["expected"].get("agentContext") {
+                    verify_agent_approval_receipt(&receipt, &expected, agent_context, &opts)
+                        .map(|_| ())
+                } else {
+                    verify_approval_receipt_with_options(&receipt, &expected, &opts).map(|_| ())
+                }
+            }
+            "delegation" => {
+                let receipt: ApprovalReceipt =
+                    serde_json::from_value(case["receipt"].clone()).unwrap();
+                verify_delegation(
+                    &receipt,
+                    &tenant_expected(&case["expected"], &keys, tenant),
+                    &opts,
+                )
+                .map(|_| ())
+            }
+            "authority" => {
+                let receipt: ApprovalReceipt =
+                    serde_json::from_value(case["receipt"].clone()).unwrap();
+                let expected = tenant_expected(&case["expected"], &keys, tenant);
+                let authority_expected = AgentAuthorityExpectation {
+                    approvers: expected.approvers,
+                    target: expected.target,
+                    agent_did: case["expected"]["agentDid"].as_str().unwrap().into(),
+                    requirement: expected.requirement,
+                    tenant_id: expected.tenant_id,
+                };
+                verify_agent_authority(&receipt, &authority_expected, &opts).map(|_| ())
+            }
+            "platform" => {
+                let e = &case["expected"];
+                let expected = PlatformReceiptExpectation {
+                    approvers: ApproverTrustAnchor::PublicKeys(
+                        e["approverKeyIds"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|id| {
+                                keys[id.as_str().unwrap()]["coseB64"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned()
+                            })
+                            .collect(),
+                    ),
+                    payload_hash: e["payloadHash"].as_str().unwrap().into(),
+                    rp_id: e["rpId"].as_str().unwrap().into(),
+                    nonce: e["nonce"].as_str().unwrap().into(),
+                    subject_external_id: e["subjectExternalId"].as_str().map(str::to_owned),
+                    tenant_id: tenant.map(str::to_owned),
+                };
+                let receipt: PlatformReceipt =
+                    serde_json::from_value(case["receipt"].clone()).unwrap();
+                verify_platform_receipt(&receipt, &expected, &opts).map(|_| ())
+            }
+            "approval-with-delegation" => {
+                let delegation: ApprovalReceipt =
+                    serde_json::from_value(case["delegationReceipt"].clone()).unwrap();
+                let seal_expected = tenant_expected(
+                    &case["delegationExpected"],
+                    &keys,
+                    case["delegationExpectedTenantId"].as_str(),
+                );
+                match verify_delegation(&delegation, &seal_expected, &opts) {
+                    Ok(delegation) => {
+                        let receipt: ApprovalReceipt =
+                            serde_json::from_value(case["receipt"].clone()).unwrap();
+                        let mut opts = opts;
+                        opts.delegation = Some(delegation);
+                        verify_approval_receipt_with_options(
+                            &receipt,
+                            &tenant_expected(&case["expected"], &keys, tenant),
+                            &opts,
+                        )
+                        .map(|_| ())
+                    }
+                    Err(reason) => Err(reason),
+                }
+            }
+            "authority-chain" => {
+                let chain: Vec<AgentAuthorityChainLink> = case["chain"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|link| AgentAuthorityChainLink {
+                        receipt: serde_json::from_value(link["receipt"].clone()).unwrap(),
+                        expected: tenant_authority_expected(
+                            &link["expected"],
+                            &keys,
+                            link["expectedTenantId"].as_str(),
+                        ),
+                    })
+                    .collect();
+                let action: AgentDelegatedAction =
+                    serde_json::from_value(case["action"].clone()).unwrap();
+                verify_agent_delegation_chain(&chain, &action, &opts).map(|_| ())
+            }
+            other => panic!("unknown tenant verifier {other}"),
+        };
+        assert_eq!(
+            result.is_ok(),
+            case["ok"].as_bool().unwrap(),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn shared_agent_receipt_digest_signer_did_projections() {
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vectors/tenant-binding-vectors.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    for case in vectors["agentReceiptDigestCases"].as_array().unwrap() {
+        let receipt: ApprovalReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
+        assert_eq!(
+            agent_receipt_digest(&receipt).unwrap(),
+            case["expected"].as_str().unwrap(),
+            "{}",
+            case["name"].as_str().unwrap()
+        );
+    }
+}
+
 #[test]
 fn shared_canonical_authority_and_platform_builders() {
     let v: Value = serde_json::from_str(
@@ -304,13 +582,20 @@ fn shared_canonical_authority_and_platform_builders() {
     for item in v["agentIntentPayloads"].as_array().unwrap() {
         let i = &item["input"];
         let requester: RequesterIdentity = serde_json::from_value(i["requester"].clone()).unwrap();
-        let requirement: ApprovalRequirement = serde_json::from_value(i["requirement"].clone()).unwrap();
+        let requirement: ApprovalRequirement =
+            serde_json::from_value(i["requirement"].clone()).unwrap();
         let got = canonical_agent_intent_payload(
-            i["target"].as_str().unwrap(), i["actionType"].as_str().unwrap(),
-            i["actionDescription"].as_str().unwrap(), &i["params"], &requester,
-            &requirement, i["nonce"].as_str().unwrap(), i["expiresAt"].as_str().unwrap(),
+            i["target"].as_str().unwrap(),
+            i["actionType"].as_str().unwrap(),
+            i["actionDescription"].as_str().unwrap(),
+            &i["params"],
+            &requester,
+            &requirement,
+            i["nonce"].as_str().unwrap(),
+            i["expiresAt"].as_str().unwrap(),
             &i["agentContext"],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(got, item["expected"].as_str().unwrap());
     }
     for item in v["platformIntentPayloads"]["cases"].as_array().unwrap() {

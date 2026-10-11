@@ -36,7 +36,7 @@ pub(crate) fn backup_flags_problem(witness: &ApprovalWitness) -> Option<String> 
             } else {
                 Some(format!(
                     "signer {} used a backup-eligible (synced) passkey — authenticatorData BE/BS flag set — but the signed policy requires a hardware-backed WebAuthn credential",
-                    witness.signer_did
+                    witness.signer_did.as_deref().unwrap_or("")
                 ))
             }
         }
@@ -238,6 +238,10 @@ fn parse_cose_p256_key(cose_buf: &[u8]) -> Result<VerifyingKey, String> {
     sec1.extend_from_slice(&y);
     parse_p256_public_key(&sec1)
         .ok_or_else(|| "invalid COSE public key format: point is not a valid P-256 key".to_string())
+}
+
+pub(super) fn cose_p256_fingerprint(cose_buf: &[u8]) -> Result<Vec<u8>, String> {
+    parse_cose_p256_key(cose_buf).map(|key| key.to_encoded_point(false).as_bytes().to_vec())
 }
 
 #[derive(serde::Deserialize)]

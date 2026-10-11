@@ -9,6 +9,7 @@ use p256::PublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
 pub mod bundle;
@@ -20,6 +21,8 @@ mod webauthn;
 
 /// DIV protocol version (docs/DIV.md v1).
 pub const DIV_VERSION: i64 = 1;
+/// Tenant-bound DIV payload version. Version 1 remains byte-for-byte supported for legacy callers.
+pub const DIV_TENANT_VERSION: i64 = 2;
 /// DIV Intent Payload `type` discriminator.
 pub const DIV_INTENT_TYPE: &str = "div-intent-verification";
 /// Offline approval (DIV §5a.2): a normal quorum approval collected OUT OF BAND at incident time
@@ -236,7 +239,7 @@ pub struct RequesterIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalWitness {
     #[serde(rename = "signerDid", default)]
-    pub signer_did: String,
+    pub signer_did: Option<String>,
     #[serde(rename = "signerPublicKey")]
     pub signer_public_key: String,
     pub signature: String,
@@ -325,6 +328,8 @@ pub struct PlatformReceiptExpectation {
     pub rp_id: String,
     pub nonce: String,
     pub subject_external_id: Option<String>,
+    /// Independently trusted tenant binding. Required for v2 receipts; supplying it refuses v1.
+    pub tenant_id: Option<String>,
 }
 
 pub struct AgentAuthorityExpectation {
@@ -334,6 +339,8 @@ pub struct AgentAuthorityExpectation {
     /// STRONGLY RECOMMENDED: YOUR sealing policy for agent authority (DIV §5b.3, §5 step 3d). `None`
     /// enforces only the sealers' own stated quorum. See [`RequirementFloor`].
     pub requirement: Option<RequirementFloor>,
+    /// Independently trusted tenant binding. Required for v2 receipts; supplying it refuses v1.
+    pub tenant_id: Option<String>,
 }
 
 /// The MINIMUM approval requirement the relying party's own policy demands (DIV §5 step 3d).
@@ -397,6 +404,7 @@ fn check_requirement_floor(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifiedAgentAuthority {
+    pub tenant_id: Option<String>,
     pub agent_did: String,
     pub target: String,
     pub action_patterns: Vec<String>,
@@ -443,6 +451,9 @@ pub struct Expected {
     pub nonce: String,
     pub action_type: String,
     pub params: Value,
+    /// Optional independently asserted requester identity. When present it must match the signed
+    /// receipt requester; delegated-agent verification requires it.
+    pub requester_did: Option<String>,
     /// REQUIRED. There is deliberately no default: a receipt must not vouch for its own signer.
     pub approvers: ApproverTrustAnchor,
     /// STRONGLY RECOMMENDED: the minimum requirement YOUR approval rule demands (see
@@ -451,6 +462,8 @@ pub struct Expected {
     /// already be at least as strict (DIV §5a.5). [`verify_delegation`] applies it to the sealing
     /// requirement.
     pub requirement: Option<RequirementFloor>,
+    /// Independently trusted tenant binding. Required for v2 receipts; supplying it refuses v1.
+    pub tenant_id: Option<String>,
 }
 
 impl ApproverTrustAnchor {
@@ -540,7 +553,7 @@ impl ApproverTrustAnchor {
 /// Relying-party context required to verify certain receipts. The WebAuthn expectations are
 /// mandatory for a WEBAUTHN receipt: without a pinned origin and RP ID, an assertion harvested
 /// at any relying party would verify.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct VerifyOptions {
     /// Opt in to attesting policy AUTO_APPROVED receipts, which carry no human signature.
     /// Off by default: such receipts fail closed.
@@ -570,12 +583,35 @@ pub struct VerifyOptions {
     /// A delegation ALREADY verified by [`verify_delegation`], substituting the eligible approver set
     /// and the quorum for this one verification (DIV §5a.6). Only meaningful with `allow_offline`.
     pub delegation: Option<VerifiedDelegation>,
+    /// Independently trusted root-to-leaf chain for an agent intent that names `delegatedBy`.
+    pub agent_authority_chain: Option<Arc<Vec<AgentAuthorityChainLink>>>,
+}
+
+/// One authority receipt plus the caller-owned scope and approver anchor used to verify it.
+pub struct AgentAuthorityChainLink {
+    pub receipt: ApprovalReceipt,
+    pub expected: AgentAuthorityExpectation,
+}
+
+/// The independently asserted action whose authority chain is being checked.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDelegatedAction {
+    pub tenant_id: Option<String>,
+    pub target: String,
+    pub action_type: String,
+    pub agent_did: String,
+    pub delegated_by: String,
 }
 
 /// A delegation whose own signature, quorum and window have been checked by [`verify_delegation`].
 /// It is an INPUT to a later approval check, never a substitute for one.
 #[derive(Debug, Clone, Default)]
 pub struct VerifiedDelegation {
+    /// Tenant bound by the verified seal (None only for legacy v1).
+    pub tenant_id: Option<String>,
+    /// Requester DID frozen by the signed seal and required on any offline approval using it.
+    pub requester_did: String,
     /// Identities permitted to approve at incident time, deduplicated.
     pub delegated_to: Vec<String>,
     /// How many distinct members of `delegated_to` must sign. Same width as
@@ -696,7 +732,7 @@ pub fn stable_stringify(value: &Value) -> Result<String, String> {
 /// `Err` means the params contain a non-portable number (see [`stable_stringify`]) — the payload
 /// could never verify in the other language ports, so it is refused rather than built.
 #[allow(clippy::too_many_arguments)]
-pub fn canonical_intent_payload(
+fn canonical_intent_payload_value(
     target: &str,
     action_type: &str,
     display: &str,
@@ -705,9 +741,9 @@ pub fn canonical_intent_payload(
     requirement: &ApprovalRequirement,
     nonce: &str,
     expires_at: &str,
-) -> Result<String, String> {
+) -> Value {
     let (req, rq) = canonical_common(requester, requirement);
-    let obj = serde_json::json!({
+    serde_json::json!({
         "v": DIV_VERSION,
         "type": DIV_INTENT_TYPE,
         "target": target,
@@ -721,8 +757,98 @@ pub fn canonical_intent_payload(
         "requirement": rq,
         "nonce": nonce,
         "expiresAt": expires_at,
-    });
-    stable_stringify(&obj)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_intent_payload(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    expires_at: &str,
+) -> Result<String, String> {
+    stable_stringify(&canonical_intent_payload_value(
+        target,
+        action_type,
+        display,
+        params,
+        requester,
+        requirement,
+        nonce,
+        expires_at,
+    ))
+}
+
+/// Serialize a newly built canonical payload as v1 or tenant-bound v2. The builder passes the
+/// structured value here exactly once: converting canonical text back through `from_str` can
+/// round a fractional number before v2 is serialized, producing different signed bytes by version.
+fn canonical_payload_with_tenant(
+    mut value: Value,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    let Some(tenant_id) = tenant_id else {
+        return stable_stringify(&value);
+    };
+    if tenant_id.is_empty() {
+        return Err("tenant_id must be a non-empty opaque identifier".into());
+    }
+    let object = value.as_object_mut().ok_or("invalid canonical payload")?;
+    object.insert("v".into(), Value::from(DIV_TENANT_VERSION));
+    object.insert("tenantId".into(), Value::String(tenant_id.into()));
+    stable_stringify(&value)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_intent_payload_with_tenant(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    expires_at: &str,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    canonical_payload_with_tenant(
+        canonical_intent_payload_value(
+            target,
+            action_type,
+            display,
+            params,
+            requester,
+            requirement,
+            nonce,
+            expires_at,
+        ),
+        tenant_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_agent_intent_payload_value(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    exp: &str,
+    context: &Value,
+) -> Value {
+    let (req, rq) = canonical_common(requester, requirement);
+    serde_json::json!({
+        "v": DIV_VERSION, "type": DIV_INTENT_TYPE, "target": target,
+        "actionType": action_type, "display": display, "params": params,
+        "evidence": Value::Null, "requester": req, "requirement": rq,
+        "nonce": nonce, "action": context.get("action"), "agent": context.get("agent"),
+        "session": context.get("session"), "nbf": context.get("nbf"), "exp": exp,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -737,14 +863,46 @@ pub fn canonical_agent_intent_payload(
     exp: &str,
     context: &Value,
 ) -> Result<String, String> {
-    let (req, rq) = canonical_common(requester, requirement);
-    stable_stringify(&serde_json::json!({
-        "v": DIV_VERSION, "type": DIV_INTENT_TYPE, "target": target,
-        "actionType": action_type, "display": display, "params": params,
-        "evidence": Value::Null, "requester": req, "requirement": rq,
-        "nonce": nonce, "action": context.get("action"), "agent": context.get("agent"),
-        "session": context.get("session"), "nbf": context.get("nbf"), "exp": exp,
-    }))
+    stable_stringify(&canonical_agent_intent_payload_value(
+        target,
+        action_type,
+        display,
+        params,
+        requester,
+        requirement,
+        nonce,
+        exp,
+        context,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_agent_intent_payload_with_tenant(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    exp: &str,
+    context: &Value,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    canonical_payload_with_tenant(
+        canonical_agent_intent_payload_value(
+            target,
+            action_type,
+            display,
+            params,
+            requester,
+            requirement,
+            nonce,
+            exp,
+            context,
+        ),
+        tenant_id,
+    )
 }
 
 /// The requester + requirement projection shared by all three canonical builders.
@@ -795,7 +953,7 @@ fn canonical_common(
 /// `challenged_at` exists so a verifier can bound the validity WINDOW, not merely the expiry: a
 /// payload minted with an over-long `expires_at` is otherwise indistinguishable from a correct one.
 #[allow(clippy::too_many_arguments)]
-pub fn canonical_offline_intent_payload(
+fn canonical_offline_intent_payload_value(
     target: &str,
     action_type: &str,
     display: &str,
@@ -805,9 +963,9 @@ pub fn canonical_offline_intent_payload(
     nonce: &str,
     challenged_at: &str,
     expires_at: &str,
-) -> Result<String, String> {
+) -> Value {
     let (req, rq) = canonical_common(requester, requirement);
-    stable_stringify(&serde_json::json!({
+    serde_json::json!({
         "v": DIV_VERSION,
         "type": DIV_OFFLINE_INTENT_TYPE,
         "target": target,
@@ -822,7 +980,61 @@ pub fn canonical_offline_intent_payload(
         "nonce": nonce,
         "challengedAt": challenged_at,
         "expiresAt": expires_at,
-    }))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_offline_intent_payload(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    challenged_at: &str,
+    expires_at: &str,
+) -> Result<String, String> {
+    stable_stringify(&canonical_offline_intent_payload_value(
+        target,
+        action_type,
+        display,
+        params,
+        requester,
+        requirement,
+        nonce,
+        challenged_at,
+        expires_at,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_offline_intent_payload_with_tenant(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    challenged_at: &str,
+    expires_at: &str,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    canonical_payload_with_tenant(
+        canonical_offline_intent_payload_value(
+            target,
+            action_type,
+            display,
+            params,
+            requester,
+            requirement,
+            nonce,
+            challenged_at,
+            expires_at,
+        ),
+        tenant_id,
+    )
 }
 
 /// Build a byte-identical DELEGATION payload (DIV §5a.5) — a signed statement about WHO MAY APPROVE,
@@ -831,6 +1043,44 @@ pub fn canonical_offline_intent_payload(
 /// `delegated_to` is sorted because it is a SET, exactly as `allowed_aaguids` is. `requirement`
 /// describes the quorum that signed this delegation; `delegated_quorum` is how many of `delegated_to`
 /// must sign at incident time. Two different quorums, so both are in the signed bytes.
+#[allow(clippy::too_many_arguments)]
+fn canonical_delegation_payload_value(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    delegated_to: &[String],
+    delegated_quorum: i64,
+    nonce: &str,
+    sealed_at: &str,
+    expires_at: &str,
+) -> Value {
+    let (req, rq) = canonical_common(requester, requirement);
+    let mut delegates = delegated_to.to_vec();
+    // UTF-16 code units, not Rust's native UTF-8 byte order — the same comparator the object
+    // keys use. The two differ only for non-BMP characters, which no AAGUID (hex UUID) or DID
+    // carries today, but a set sorted one way here and another in the TS reference produces
+    // different SIGNED BYTES, caught by nothing until a receipt fails elsewhere. DIV §4.3.3.
+    delegates.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+    serde_json::json!({
+        "v": DIV_VERSION,
+        "type": DIV_DELEGATION_TYPE,
+        "target": target,
+        "actionType": action_type,
+        "display": display,
+        "params": params,
+        "requester": req,
+        "requirement": rq,
+        "delegatedTo": delegates,
+        "delegatedQuorum": delegated_quorum,
+        "nonce": nonce,
+        "sealedAt": sealed_at,
+        "expiresAt": expires_at,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn canonical_delegation_payload(
     target: &str,
@@ -845,28 +1095,52 @@ pub fn canonical_delegation_payload(
     sealed_at: &str,
     expires_at: &str,
 ) -> Result<String, String> {
-    let (req, rq) = canonical_common(requester, requirement);
-    let mut delegates = delegated_to.to_vec();
-    // UTF-16 code units, not Rust's native UTF-8 byte order — the same comparator the object
-    // keys use. The two differ only for non-BMP characters, which no AAGUID (hex UUID) or DID
-    // carries today, but a set sorted one way here and another in the TS reference produces
-    // different SIGNED BYTES, caught by nothing until a receipt fails elsewhere. DIV §4.3.3.
-    delegates.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
-    stable_stringify(&serde_json::json!({
-        "v": DIV_VERSION,
-        "type": DIV_DELEGATION_TYPE,
-        "target": target,
-        "actionType": action_type,
-        "display": display,
-        "params": params,
-        "requester": req,
-        "requirement": rq,
-        "delegatedTo": delegates,
-        "delegatedQuorum": delegated_quorum,
-        "nonce": nonce,
-        "sealedAt": sealed_at,
-        "expiresAt": expires_at,
-    }))
+    stable_stringify(&canonical_delegation_payload_value(
+        target,
+        action_type,
+        display,
+        params,
+        requester,
+        requirement,
+        delegated_to,
+        delegated_quorum,
+        nonce,
+        sealed_at,
+        expires_at,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_delegation_payload_with_tenant(
+    target: &str,
+    action_type: &str,
+    display: &str,
+    params: &Value,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    delegated_to: &[String],
+    delegated_quorum: i64,
+    nonce: &str,
+    sealed_at: &str,
+    expires_at: &str,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    canonical_payload_with_tenant(
+        canonical_delegation_payload_value(
+            target,
+            action_type,
+            display,
+            params,
+            requester,
+            requirement,
+            delegated_to,
+            delegated_quorum,
+            nonce,
+            sealed_at,
+            expires_at,
+        ),
+        tenant_id,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -896,6 +1170,31 @@ pub fn canonical_agent_authority_payload(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn canonical_agent_authority_payload_value(
+    target: &str,
+    action_patterns: &[String],
+    display: &str,
+    agent_did: &str,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    sealed_at: &str,
+    expires_at: &str,
+    parent_receipt_hash: Option<&str>,
+) -> Value {
+    let (req, rq) = canonical_common(requester, requirement);
+    let mut patterns = action_patterns.to_vec();
+    patterns.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+    serde_json::json!({
+        "v": DIV_VERSION, "type": DIV_AGENT_AUTHORITY_TYPE, "target": target,
+        "actionPatterns": patterns, "display": display, "agent": { "did": agent_did },
+        "parentReceiptHash": parent_receipt_hash,
+        "requester": req, "requirement": rq, "nonce": nonce,
+        "sealedAt": sealed_at, "expiresAt": expires_at,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn canonical_agent_authority_payload_with_parent(
     target: &str,
     action_patterns: &[String],
@@ -908,16 +1207,65 @@ pub fn canonical_agent_authority_payload_with_parent(
     expires_at: &str,
     parent_receipt_hash: Option<&str>,
 ) -> Result<String, String> {
-    let (req, rq) = canonical_common(requester, requirement);
-    let mut patterns = action_patterns.to_vec();
-    patterns.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
-    stable_stringify(&serde_json::json!({
-        "v": DIV_VERSION, "type": DIV_AGENT_AUTHORITY_TYPE, "target": target,
-        "actionPatterns": patterns, "display": display, "agent": { "did": agent_did },
-        "parentReceiptHash": parent_receipt_hash,
-        "requester": req, "requirement": rq, "nonce": nonce,
-        "sealedAt": sealed_at, "expiresAt": expires_at,
-    }))
+    stable_stringify(&canonical_agent_authority_payload_value(
+        target,
+        action_patterns,
+        display,
+        agent_did,
+        requester,
+        requirement,
+        nonce,
+        sealed_at,
+        expires_at,
+        parent_receipt_hash,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_agent_authority_payload_with_parent_and_tenant(
+    target: &str,
+    action_patterns: &[String],
+    display: &str,
+    agent_did: &str,
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    nonce: &str,
+    sealed_at: &str,
+    expires_at: &str,
+    parent_receipt_hash: Option<&str>,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    canonical_payload_with_tenant(
+        canonical_agent_authority_payload_value(
+            target,
+            action_patterns,
+            display,
+            agent_did,
+            requester,
+            requirement,
+            nonce,
+            sealed_at,
+            expires_at,
+            parent_receipt_hash,
+        ),
+        tenant_id,
+    )
+}
+
+fn canonical_platform_intent_payload_value(
+    payload_hash: &str,
+    rp_id: &str,
+    subject_external_id: &str,
+    signed_at: &str,
+    expires_at: &str,
+    nonce: &str,
+) -> Value {
+    serde_json::json!({
+        "v": DIV_VERSION, "type": DIV_PLATFORM_INTENT_TYPE, "hashAlg": "SHA-256",
+        "payloadHash": payload_hash, "rpId": rp_id,
+        "subject": { "externalId": subject_external_id }, "signedAt": signed_at,
+        "expiresAt": expires_at, "nonce": nonce,
+    })
 }
 
 pub fn canonical_platform_intent_payload(
@@ -928,12 +1276,36 @@ pub fn canonical_platform_intent_payload(
     expires_at: &str,
     nonce: &str,
 ) -> Result<String, String> {
-    stable_stringify(&serde_json::json!({
-        "v": DIV_VERSION, "type": DIV_PLATFORM_INTENT_TYPE, "hashAlg": "SHA-256",
-        "payloadHash": payload_hash, "rpId": rp_id,
-        "subject": { "externalId": subject_external_id }, "signedAt": signed_at,
-        "expiresAt": expires_at, "nonce": nonce,
-    }))
+    stable_stringify(&canonical_platform_intent_payload_value(
+        payload_hash,
+        rp_id,
+        subject_external_id,
+        signed_at,
+        expires_at,
+        nonce,
+    ))
+}
+
+pub fn canonical_platform_intent_payload_with_tenant(
+    payload_hash: &str,
+    rp_id: &str,
+    subject_external_id: &str,
+    signed_at: &str,
+    expires_at: &str,
+    nonce: &str,
+    tenant_id: Option<&str>,
+) -> Result<String, String> {
+    canonical_payload_with_tenant(
+        canonical_platform_intent_payload_value(
+            payload_hash,
+            rp_id,
+            subject_external_id,
+            signed_at,
+            expires_at,
+            nonce,
+        ),
+        tenant_id,
+    )
 }
 
 /// Read a string field out of the canonical payload JSON, or None.
@@ -941,6 +1313,34 @@ fn canonical_str_field(canonical: &str, key: &str) -> Option<String> {
     serde_json::from_str::<Value>(canonical)
         .ok()
         .and_then(|v| v.get(key).and_then(|x| x.as_str().map(String::from)))
+}
+
+/// Enforce tenant binding from caller-owned state. A receipt's tenant is only compared; it never
+/// supplies the expected value. V1 remains valid only for callers that did not assert a tenant.
+fn check_tenant_binding(value: &Value, expected: Option<&str>) -> Result<Option<String>, String> {
+    match value.get("v").and_then(Value::as_i64) {
+        Some(DIV_VERSION) => {
+            if expected.is_some() {
+                return Err("legacy v1 receipt cannot satisfy an expected tenant".into());
+            }
+            Ok(None)
+        }
+        Some(DIV_TENANT_VERSION) => {
+            let signed = value
+                .get("tenantId")
+                .and_then(Value::as_str)
+                .filter(|tenant| !tenant.is_empty())
+                .ok_or("v2 receipt is missing a non-empty tenantId")?;
+            let expected = expected
+                .filter(|tenant| !tenant.is_empty())
+                .ok_or("v2 receipt requires a caller-supplied non-empty tenant_id")?;
+            if signed != expected {
+                return Err("receipt is for a different tenant".into());
+            }
+            Ok(Some(signed.to_string()))
+        }
+        _ => Err("unsupported DIV payload version".into()),
+    }
 }
 
 /// Parse a signed RFC 3339 timestamp to a Unix second count (fraction floored), or None.
@@ -963,7 +1363,13 @@ fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
         }
         std::str::from_utf8(part).ok()?.parse().ok()
     };
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
     let year = digits(0, 4)?;
@@ -1150,9 +1556,7 @@ fn verify_approval_receipt_inner(
     // Version / type / nonce gate.
     let probe: Value = serde_json::from_str(&receipt.canonical_payload)
         .map_err(|_| "canonicalPayload is not valid JSON".to_string())?;
-    if probe.get("v").and_then(Value::as_i64) != Some(DIV_VERSION) {
-        return Err("unsupported DIV payload version".to_string());
-    }
+    let tenant_id = check_tenant_binding(&probe, expected.tenant_id.as_deref())?;
     let payload_type = probe
         .get("type")
         .and_then(Value::as_str)
@@ -1191,6 +1595,13 @@ fn verify_approval_receipt_inner(
         .requester
         .as_ref()
         .ok_or("receipt missing requester")?;
+    if expected
+        .requester_did
+        .as_deref()
+        .is_some_and(|did| requester.did != did)
+    {
+        return Err("approval was requested by a different principal".into());
+    }
 
     let agent_intent = probe.get("agent").is_some();
     if agent_intent != agent_context.is_some() {
@@ -1209,14 +1620,39 @@ fn verify_approval_receipt_inner(
             receipt.sig_alg.as_deref(),
         )
         .map_err(|problem| format!("invalid independently asserted agent context: {problem}"))?;
-        if agent_context
+        if let Some(delegated_by) = agent_context
             .and_then(|c| c.get("agent"))
             .and_then(|a| a.get("delegatedBy"))
-            .is_some_and(|value| !value.is_null())
+            .and_then(Value::as_str)
         {
-            return Err(
-                "delegated agent receipt requires a trusted root-to-leaf authority chain".into(),
-            );
+            let chain = opts
+                .agent_authority_chain
+                .as_deref()
+                .ok_or("delegated agent receipt requires a trusted root-to-leaf authority chain")?;
+            if chain.is_empty() {
+                return Err(
+                    "delegated agent receipt requires a trusted root-to-leaf authority chain"
+                        .into(),
+                );
+            }
+            let requester_did = expected
+                .requester_did
+                .as_deref()
+                .filter(|did| !did.is_empty())
+                .ok_or(
+                    "delegated agent receipt requires an independently asserted requester DID",
+                )?;
+            verify_agent_delegation_chain(
+                chain,
+                &AgentDelegatedAction {
+                    tenant_id: tenant_id.clone(),
+                    target: expected.target.clone(),
+                    action_type: expected.action_type.clone(),
+                    agent_did: requester_did.to_string(),
+                    delegated_by: delegated_by.to_string(),
+                },
+                opts,
+            )?;
         }
         let (now, skew) = evaluation_time(opts);
         if from_ms > (now + skew) * 1000 {
@@ -1313,6 +1749,15 @@ fn verify_approval_receipt_inner(
         if d.target != expected.target {
             return Err("the delegation was issued for a different target".to_string());
         }
+        if d.tenant_id != tenant_id {
+            return Err("the delegation is bound to a different tenant".into());
+        }
+        if requester.did != d.requester_did {
+            return Err(
+                "offline approval was requested by a different principal than the delegation"
+                    .into(),
+            );
+        }
         if d.action_type != expected.action_type {
             return Err("the delegation was issued for a different actionType".to_string());
         }
@@ -1340,7 +1785,7 @@ fn verify_approval_receipt_inner(
     }
 
     let recomputed = if offline {
-        canonical_offline_intent_payload(
+        canonical_offline_intent_payload_with_tenant(
             &expected.target,
             &expected.action_type,
             &receipt.action_description,
@@ -1350,9 +1795,10 @@ fn verify_approval_receipt_inner(
             &payload_nonce,
             &challenged_at,
             &expires_at,
+            tenant_id.as_deref(),
         )
     } else if let Some(context) = agent_context {
-        canonical_agent_intent_payload(
+        canonical_agent_intent_payload_with_tenant(
             &expected.target,
             &expected.action_type,
             &receipt.action_description,
@@ -1362,9 +1808,10 @@ fn verify_approval_receipt_inner(
             &payload_nonce,
             &expires_at,
             context,
+            tenant_id.as_deref(),
         )
     } else {
-        canonical_intent_payload(
+        canonical_intent_payload_with_tenant(
             &expected.target,
             &expected.action_type,
             &receipt.action_description,
@@ -1373,6 +1820,7 @@ fn verify_approval_receipt_inner(
             &requirement,
             &payload_nonce,
             &expires_at,
+            tenant_id.as_deref(),
         )
     }
     // Fail closed, but with a reason DISTINCT from the "do not match" one below: that one is
@@ -1424,7 +1872,9 @@ fn verify_approval_receipt_inner(
     if requirement.required_approvals > 1
         && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
     {
-        return Err("multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)".into());
+        return Err(
+            "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)".into(),
+        );
     }
     if requirement.requester_cannot_approve
         && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
@@ -1447,11 +1897,12 @@ fn verify_approval_receipt_inner(
     // Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct
     // is load-bearing: without it, N copies of one approver's signature satisfy an N-of-M quorum.
     let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> = std::collections::HashMap::new();
+    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
+        std::collections::HashMap::new();
     let mut failures: Vec<String> = Vec::new();
     for witness in &witnesses {
         let candidates = match expected.approvers.candidates_restricted(
-            &witness.signer_did,
+            witness.signer_did.as_deref().unwrap_or(""),
             &witness.signer_public_key,
             delegated_to.as_deref(),
         ) {
@@ -1479,10 +1930,12 @@ fn verify_approval_receipt_inner(
         // A hardware-key policy is only partially checkable offline: a bare P-256 key carries no
         // attestation at all, so it can never satisfy the requirement, while a WebAuthn assertion is
         // accepted without proving the authenticator's model.
-        if requirement.requires_hardware_credential() && witness.sig_alg.as_deref() != Some("WEBAUTHN") {
+        if requirement.requires_hardware_credential()
+            && witness.sig_alg.as_deref() != Some("WEBAUTHN")
+        {
             failures.push(format!(
                 "signer {} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential",
-                witness.signer_did
+                witness.signer_did.as_deref().unwrap_or("")
             ));
             continue;
         }
@@ -1493,10 +1946,12 @@ fn verify_approval_receipt_inner(
             }
         }
         // Four-eyes, verified offline against the requester in the same signed payload.
-        if requirement.requester_cannot_approve && witness.signer_did == requester.did {
+        if requirement.requester_cannot_approve
+            && witness.signer_did.as_deref() == Some(&requester.did)
+        {
             failures.push(format!(
                 "four-eyes: requester {} cannot approve their own action",
-                witness.signer_did
+                witness.signer_did.as_deref().unwrap_or("")
             ));
             continue;
         }
@@ -1552,9 +2007,7 @@ pub fn verify_platform_receipt(
 ) -> Result<Vec<String>, String> {
     let value: Value = serde_json::from_str(&receipt.canonical_payload)
         .map_err(|_| "canonicalPayload is not valid JSON".to_string())?;
-    if value.get("v").and_then(Value::as_i64) != Some(DIV_VERSION) {
-        return Err("unsupported DIV payload version".into());
-    }
+    let tenant_id = check_tenant_binding(&value, expected.tenant_id.as_deref())?;
     match value.get("type").and_then(Value::as_str) {
         Some(DIV_PLATFORM_INTENT_TYPE) => {}
         Some(DIV_INTENT_TYPE | DIV_OFFLINE_INTENT_TYPE) => {
@@ -1616,13 +2069,14 @@ pub fn verify_platform_receipt(
     {
         return Err("receipt was signed by a different subject".into());
     }
-    let recomputed = canonical_platform_intent_payload(
+    let recomputed = canonical_platform_intent_payload_with_tenant(
         &expected.payload_hash,
         &expected.rp_id,
         subject,
         signed_at,
         expires_at,
         &expected.nonce,
+        tenant_id.as_deref(),
     )?;
     if recomputed != receipt.canonical_payload {
         return Err("payloadHash/rpId do not match what was signed".into());
@@ -1656,7 +2110,8 @@ pub fn verify_platform_receipt(
         ));
     }
     let mut verified = std::collections::BTreeSet::new();
-    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> = std::collections::HashMap::new();
+    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
+        std::collections::HashMap::new();
     let mut failures = Vec::new();
     let mut effective = opts.clone();
     effective.expected_rp_id = Some(expected.rp_id.clone());
@@ -1667,14 +2122,14 @@ pub fn verify_platform_receipt(
         if witness.sig_alg.as_deref() != Some("WEBAUTHN") {
             failures.push(format!(
                 "signer {} used a bare key; platform receipts are WebAuthn-only",
-                witness.signer_did
+                witness.signer_did.as_deref().unwrap_or("")
             ));
             continue;
         }
-        let candidates = match expected
-            .approvers
-            .candidates(&witness.signer_did, &witness.signer_public_key)
-        {
+        let candidates = match expected.approvers.candidates(
+            witness.signer_did.as_deref().unwrap_or(""),
+            &witness.signer_public_key,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 failures.push(e);
@@ -1737,9 +2192,7 @@ pub fn verify_agent_authority(
 ) -> Result<VerifiedAgentAuthority, String> {
     let value: Value = serde_json::from_str(&receipt.canonical_payload)
         .map_err(|_| "canonicalPayload is not valid JSON")?;
-    if value.get("v").and_then(Value::as_i64) != Some(DIV_VERSION) {
-        return Err("unsupported DIV payload version".into());
-    }
+    let tenant_id = check_tenant_binding(&value, expected.tenant_id.as_deref())?;
     if value.get("type").and_then(Value::as_str) != Some(DIV_AGENT_AUTHORITY_TYPE) {
         return Err("payload is not a div-agent-authority".into());
     }
@@ -1821,7 +2274,9 @@ pub fn verify_agent_authority(
     if requirement.required_approvals > 1
         && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
     {
-        return Err("multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)".into());
+        return Err(
+            "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)".into(),
+        );
     }
     if requirement.requester_cannot_approve
         && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
@@ -1832,7 +2287,7 @@ pub fn verify_agent_authority(
         .get("nonce")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let recomputed = canonical_agent_authority_payload_with_parent(
+    let recomputed = canonical_agent_authority_payload_with_parent_and_tenant(
         &expected.target,
         &patterns,
         &receipt.action_description,
@@ -1843,6 +2298,7 @@ pub fn verify_agent_authority(
         sealed_at,
         expires_at,
         parent_receipt_hash.as_deref(),
+        tenant_id.as_deref(),
     )?;
     if recomputed != receipt.canonical_payload {
         return Err("target/agent/actionPatterns do not match what was sealed".into());
@@ -1864,13 +2320,14 @@ pub fn verify_agent_authority(
         ));
     }
     let mut verified = std::collections::BTreeSet::new();
-    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> = std::collections::HashMap::new();
+    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
+        std::collections::HashMap::new();
     let mut failures = Vec::new();
     for witness in witnesses {
-        let candidates = match expected
-            .approvers
-            .candidates(&witness.signer_did, &witness.signer_public_key)
-        {
+        let candidates = match expected.approvers.candidates(
+            witness.signer_did.as_deref().unwrap_or(""),
+            &witness.signer_public_key,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 failures.push(e);
@@ -1888,8 +2345,10 @@ pub fn verify_agent_authority(
             failures.push("signature does not verify against any trusted approver key".into());
             continue;
         };
-        if requirement.requires_hardware_credential() && witness.sig_alg.as_deref() != Some("WEBAUTHN") {
-            failures.push(format!("signer {} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential", witness.signer_did));
+        if requirement.requires_hardware_credential()
+            && witness.sig_alg.as_deref() != Some("WEBAUTHN")
+        {
+            failures.push(format!("signer {} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential", witness.signer_did.as_deref().unwrap_or("")));
             continue;
         }
         if requirement.require_hardware_key {
@@ -1898,10 +2357,12 @@ pub fn verify_agent_authority(
                 continue;
             }
         }
-        if requirement.requester_cannot_approve && witness.signer_did == requester.did {
+        if requirement.requester_cannot_approve
+            && witness.signer_did.as_deref() == Some(&requester.did)
+        {
             failures.push(format!(
                 "four-eyes: requester {} cannot seal their own request",
-                witness.signer_did
+                witness.signer_did.as_deref().unwrap_or("")
             ));
             continue;
         }
@@ -1923,6 +2384,7 @@ pub fn verify_agent_authority(
     unique.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
     unique.dedup();
     Ok(VerifiedAgentAuthority {
+        tenant_id,
         agent_did: expected.agent_did.clone(),
         target: expected.target.clone(),
         action_patterns: unique,
@@ -1932,6 +2394,107 @@ pub fn verify_agent_authority(
         sealed_at: sealed_at.into(),
         expires_at: expires_at.into(),
     })
+}
+
+/// Commit to the complete authority receipt, including every signature witness in canonical order.
+pub fn agent_receipt_digest(receipt: &ApprovalReceipt) -> Result<String, String> {
+    let mut witnesses: Vec<Value> = witnesses_of(receipt)
+        .into_iter()
+        .map(|w| {
+            serde_json::json!({
+                "signerDid": w.signer_did,
+                "signerPublicKey": w.signer_public_key,
+                "signature": w.signature,
+                "sigAlg": w.sig_alg,
+                "authenticatorData": w.authenticator_data,
+                "clientDataJSON": w.client_data_json,
+            })
+        })
+        .collect();
+    let mut serialized = Vec::with_capacity(witnesses.len());
+    for witness in witnesses.drain(..) {
+        serialized.push(stable_stringify(&witness)?);
+    }
+    serialized.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+    let content = stable_stringify(&serde_json::json!({
+        "canonicalPayload": receipt.canonical_payload,
+        "witnesses": serialized.iter().map(|s| serde_json::from_str::<Value>(s).unwrap()).collect::<Vec<_>>(),
+    }))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"intyga-agent-receipt-v1\0");
+    hasher.update(content.as_bytes());
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Verify a complete root-to-leaf human-sealed agent authority chain. This proves governance scope
+/// only; the action still requires its ordinary approval receipt.
+pub fn verify_agent_delegation_chain(
+    chain: &[AgentAuthorityChainLink],
+    action: &AgentDelegatedAction,
+    opts: &VerifyOptions,
+) -> Result<(), String> {
+    if chain.len() < 2 || !agent_digest(Some(&Value::String(action.delegated_by.clone()))) {
+        return Err("delegation requires a complete root-to-leaf authority chain".into());
+    }
+    let mut parent: Option<VerifiedAgentAuthority> = None;
+    let mut parent_hash: Option<String> = None;
+    for (index, link) in chain.iter().enumerate() {
+        let authority = verify_agent_authority(&link.receipt, &link.expected, opts)
+            .map_err(|why| format!("authority link {}: {why}", index + 1))?;
+        if authority.tenant_id != action.tenant_id {
+            return Err("authority chain and action belong to different tenants".into());
+        }
+        if authority.target != action.target {
+            return Err("delegated authority changes target".into());
+        }
+        if authority.parent_receipt_hash != parent_hash {
+            return Err("delegated authority has a missing or different parent receipt".into());
+        }
+        if let Some(previous) = &parent {
+            if authority.tenant_id != previous.tenant_id {
+                return Err("authority chain crosses tenant boundaries".into());
+            }
+            let child_sealed = parse_rfc3339_utc_secs(&authority.sealed_at)
+                .ok_or("child authority has an invalid sealedAt")?;
+            let parent_sealed = parse_rfc3339_utc_secs(&previous.sealed_at)
+                .ok_or("parent authority has an invalid sealedAt")?;
+            let child_expires = parse_rfc3339_utc_secs(&authority.expires_at)
+                .ok_or("child authority has an invalid expiresAt")?;
+            let parent_expires = parse_rfc3339_utc_secs(&previous.expires_at)
+                .ok_or("parent authority has an invalid expiresAt")?;
+            if child_sealed < parent_sealed || child_expires > parent_expires {
+                return Err("child authority outlives or predates its parent".into());
+            }
+            if authority.action_patterns.iter().any(|child| {
+                !previous.action_patterns.iter().any(|scope| {
+                    scope == "*" || child.to_lowercase().contains(&scope.to_lowercase())
+                })
+            }) {
+                return Err("child authority escalates the parent's action scope".into());
+            }
+        }
+        parent_hash =
+            Some(agent_receipt_digest(&link.receipt).map_err(|why| {
+                format!("authority link {} cannot be digested: {why}", index + 1)
+            })?);
+        parent = Some(authority);
+    }
+    let leaf = parent.ok_or("delegation requires a complete root-to-leaf authority chain")?;
+    if parent_hash.as_deref() != Some(action.delegated_by.as_str())
+        || leaf.agent_did != action.agent_did
+    {
+        return Err("action does not name its delegated agent and leaf authority receipt".into());
+    }
+    if !leaf.action_patterns.iter().any(|pattern| {
+        pattern == "*"
+            || action
+                .action_type
+                .to_lowercase()
+                .contains(&pattern.to_lowercase())
+    }) {
+        return Err("action falls outside the delegated authority".into());
+    }
+    Ok(())
 }
 
 /// Fold per-witness failure reasons into a bounded parenthetical detail string.
@@ -1978,9 +2541,7 @@ pub fn verify_delegation(
     }
     let probe: Value = serde_json::from_str(&receipt.canonical_payload)
         .map_err(|_| "canonicalPayload is not valid JSON".to_string())?;
-    if probe.get("v").and_then(Value::as_i64) != Some(DIV_VERSION) {
-        return Err("unsupported DIV payload version".to_string());
-    }
+    let tenant_id = check_tenant_binding(&probe, expected.tenant_id.as_deref())?;
     if probe.get("type").and_then(Value::as_str) != Some(DIV_DELEGATION_TYPE) {
         return Err("payload is not a div-delegation".to_string());
     }
@@ -2060,6 +2621,13 @@ pub fn verify_delegation(
         .requester
         .as_ref()
         .ok_or("delegation missing requester")?;
+    if expected
+        .requester_did
+        .as_deref()
+        .is_some_and(|did| requester.did != did)
+    {
+        return Err("approval was requested by a different principal".into());
+    }
     let requirement: ApprovalRequirement = probe
         .get("requirement")
         .cloned()
@@ -2074,7 +2642,7 @@ pub fn verify_delegation(
     let payload_nonce =
         canonical_str_field(&receipt.canonical_payload, "nonce").unwrap_or_default();
 
-    let recomputed = canonical_delegation_payload(
+    let recomputed = canonical_delegation_payload_with_tenant(
         &expected.target,
         &expected.action_type,
         &receipt.action_description,
@@ -2086,6 +2654,7 @@ pub fn verify_delegation(
         &payload_nonce,
         &sealed_at,
         &expires_at,
+        tenant_id.as_deref(),
     )
     // Same split as the approval path: this is a canonicalization refusal on the caller's own
     // params, deliberately distinct from the tampering-shaped "do not match" reason below.
@@ -2118,13 +2687,14 @@ pub fn verify_delegation(
         ));
     }
     let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> = std::collections::HashMap::new();
+    let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
+        std::collections::HashMap::new();
     let mut failures: Vec<String> = Vec::new();
     for witness in &witnesses {
-        let candidates = match expected
-            .approvers
-            .candidates(&witness.signer_did, &witness.signer_public_key)
-        {
+        let candidates = match expected.approvers.candidates(
+            witness.signer_did.as_deref().unwrap_or(""),
+            &witness.signer_public_key,
+        ) {
             Ok(c) => c,
             Err(reason) => {
                 failures.push(reason);
@@ -2146,10 +2716,12 @@ pub fn verify_delegation(
             failures.push(last);
             continue;
         };
-        if requirement.requires_hardware_credential() && witness.sig_alg.as_deref() != Some("WEBAUTHN") {
+        if requirement.requires_hardware_credential()
+            && witness.sig_alg.as_deref() != Some("WEBAUTHN")
+        {
             failures.push(format!(
                 "signer {} used a bare key, but the signed policy requires a hardware-backed WebAuthn credential",
-                witness.signer_did
+                witness.signer_did.as_deref().unwrap_or("")
             ));
             continue;
         }
@@ -2159,10 +2731,12 @@ pub fn verify_delegation(
                 continue;
             }
         }
-        if requirement.requester_cannot_approve && witness.signer_did == requester.did {
+        if requirement.requester_cannot_approve
+            && witness.signer_did.as_deref() == Some(&requester.did)
+        {
             failures.push(format!(
                 "four-eyes: requester {} cannot delegate to themselves",
-                witness.signer_did
+                witness.signer_did.as_deref().unwrap_or("")
             ));
             continue;
         }
@@ -2183,6 +2757,8 @@ pub fn verify_delegation(
     }
 
     Ok(VerifiedDelegation {
+        tenant_id,
+        requester_did: requester.did.clone(),
         // The DEDUPLICATED set: this is what gets enforced against witness DIDs later, and a duplicate
         // entry must not create the illusion of a larger eligible pool.
         delegated_to: distinct,
@@ -2199,15 +2775,26 @@ pub fn verify_delegation(
 /// Normalize a receipt to a witness list: `signatures` if present, else the single-signature fields.
 /// One key, one person (DIV §4.4.6). An identity-associating anchor that maps the SAME key to two
 /// DIDs would otherwise let that key's holder count as two approvers, since quorum counts distinct
-/// identities. A key already counted for one identity cannot count for another. Keys compare by
-/// decoded bytes (padding and base64/base64url spellings of one encoding match; the same key in
-/// another encoding, COSE vs SPKI, is not detected). Records the key when it is free.
+/// identities. P-256 keys compare by public point, so COSE and SPKI encodings of one credential
+/// match. Other encodings compare by decoded bytes. Records the key when it is free.
 fn shared_key_problem(
     counted: &mut std::collections::HashMap<Vec<u8>, String>,
     key: &str,
     identity: &str,
 ) -> Option<String> {
-    let fingerprint = webauthn::decode_base64_flexible(key).unwrap_or_else(|_| key.as_bytes().to_vec());
+    let decoded = webauthn::decode_base64_flexible(key);
+    let fingerprint = decoded.as_ref().map_or_else(
+        |_| key.as_bytes().to_vec(),
+        |bytes| {
+            if bytes.first() == Some(&0x30) {
+                parse_p256_public_key(bytes)
+                    .map(|key| key.to_encoded_point(false).as_bytes().to_vec())
+                    .unwrap_or_else(|| bytes.clone())
+            } else {
+                webauthn::cose_p256_fingerprint(bytes).unwrap_or_else(|_| bytes.clone())
+            }
+        },
+    );
     if let Some(owner) = counted.get(&fingerprint) {
         if owner != identity {
             return Some(format!(
@@ -2228,7 +2815,7 @@ fn witnesses_of(receipt: &ApprovalReceipt) -> Vec<ApprovalWitness> {
     }
     match (&receipt.signer_public_key, &receipt.signature) {
         (Some(key), Some(sig)) => vec![ApprovalWitness {
-            signer_did: receipt.signer_did.clone().unwrap_or_default(),
+            signer_did: Some(receipt.signer_did.clone().unwrap_or_default()),
             signer_public_key: key.clone(),
             signature: sig.clone(),
             sig_alg: receipt.sig_alg.clone(),
@@ -2361,7 +2948,9 @@ mod tests {
             nonce: "c_8f91a2".to_string(),
             action_type: "deleteDatabase".to_string(),
             params,
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![STANDARD.encode(spki.as_bytes())]),
+            tenant_id: None,
         };
         (receipt, expected)
     }
@@ -2530,7 +3119,9 @@ mod tests {
             nonce: "c_8f91a2".to_string(),
             action_type: "deleteDatabase".to_string(),
             params: json!({ "environment": "production" }),
+            requester_did: None,
             approvers: base.approvers,
+            tenant_id: None,
         };
         assert_eq!(
             verify_approval_receipt(&receipt, &expected),
@@ -2585,10 +3176,12 @@ mod tests {
                 params: receipt.params.clone(),
                 // For a golden vector the committed file is the enrollment record, so pinning its
                 // key is the legitimate resolution step — it still comes from outside the verifier.
+                requester_did: None,
                 approvers: ApproverTrustAnchor::PublicKeys(vec![receipt
                     .signer_public_key
                     .clone()
                     .unwrap_or_default()]),
+                tenant_id: None,
             };
 
             let result = verify_approval_receipt(&receipt, &expected);
@@ -2847,10 +3440,12 @@ mod tests {
             nonce: doc["expected"]["nonce"].as_str().unwrap().to_string(),
             action_type: doc["expected"]["actionType"].as_str().unwrap().to_string(),
             params: doc["expected"]["params"].clone(),
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![receipt
                 .signer_public_key
                 .clone()
                 .unwrap_or_default()]),
+            tenant_id: None,
         };
         WaVector {
             rp_id: doc["rpId"].as_str().unwrap().to_string(),
@@ -2936,11 +3531,13 @@ mod tests {
             nonce: v.expected.nonce.clone(),
             action_type: v.expected.action_type.clone(),
             params: json!({ "amount": 999999 }),
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![v
                 .receipt
                 .signer_public_key
                 .clone()
                 .unwrap_or_default()]),
+            tenant_id: None,
         };
         let res = verify_approval_receipt_with_options(
             &v.receipt,
@@ -2998,6 +3595,124 @@ mod tests {
     }
 
     #[test]
+    fn tenant_v2_builders_and_binding_preserve_legacy_v1() {
+        let requester = RequesterIdentity {
+            did: "did:example:human".into(),
+            attestation: None,
+        };
+        let requirement = ApprovalRequirement {
+            required_approvals: 1,
+            ..Default::default()
+        };
+        let legacy = canonical_intent_payload(
+            "target",
+            "act",
+            "Act",
+            &json!({}),
+            &requester,
+            &requirement,
+            "n",
+            "2026-10-10T00:00:00Z",
+        )
+        .unwrap();
+        let bound = canonical_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &json!({}),
+            &requester,
+            &requirement,
+            "n",
+            "2026-10-10T00:00:00Z",
+            Some("tenant-alpha"),
+        )
+        .unwrap();
+        let v1: Value = serde_json::from_str(&legacy).unwrap();
+        let v2: Value = serde_json::from_str(&bound).unwrap();
+        assert_eq!(v1["v"], DIV_VERSION);
+        assert!(v1.get("tenantId").is_none());
+        assert_eq!(v2["v"], DIV_TENANT_VERSION);
+        assert_eq!(v2["tenantId"], "tenant-alpha");
+        assert_eq!(check_tenant_binding(&v1, None), Ok(None));
+        assert!(check_tenant_binding(&v1, Some("tenant-alpha")).is_err());
+        assert!(check_tenant_binding(&v2, None).is_err());
+        assert!(check_tenant_binding(&v2, Some("tenant-beta")).is_err());
+        assert_eq!(
+            check_tenant_binding(&v2, Some("tenant-alpha")),
+            Ok(Some("tenant-alpha".into()))
+        );
+        assert!(canonical_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &json!({}),
+            &requester,
+            &requirement,
+            "n",
+            "2026-10-10T00:00:00Z",
+            Some("")
+        )
+        .is_err());
+        let offline = canonical_offline_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &json!({}),
+            &requester,
+            &requirement,
+            "n",
+            "2026-10-09T23:59:00Z",
+            "2026-10-10T00:00:00Z",
+            Some("tenant-alpha"),
+        )
+        .unwrap();
+        let delegation = canonical_delegation_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &json!({}),
+            &requester,
+            &requirement,
+            &["did:example:delegate".into()],
+            1,
+            "n",
+            "2026-10-09T23:59:00Z",
+            "2026-10-10T00:00:00Z",
+            Some("tenant-alpha"),
+        )
+        .unwrap();
+        let authority = canonical_agent_authority_payload_with_parent_and_tenant(
+            "target",
+            &["act".into()],
+            "Act",
+            "did:example:agent",
+            &requester,
+            &requirement,
+            "n",
+            "2026-10-09T23:59:00Z",
+            "2026-10-10T00:00:00Z",
+            None,
+            Some("tenant-alpha"),
+        )
+        .unwrap();
+        let platform = canonical_platform_intent_payload_with_tenant(
+            &"a".repeat(64),
+            "rp.example",
+            "subject-1",
+            "2026-10-09T23:59:00Z",
+            "2026-10-10T00:00:00Z",
+            "n",
+            Some("tenant-alpha"),
+        )
+        .unwrap();
+        for payload in [offline, delegation, authority, platform] {
+            let parsed: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(parsed["v"], DIV_TENANT_VERSION);
+            assert_eq!(parsed["tenantId"], "tenant-alpha");
+        }
+    }
+
+    #[test]
     fn test_expiry_fail_closed_and_allow_expired() {
         // Build a receipt that expired in 2020.
         let requester = RequesterIdentity {
@@ -3041,7 +3756,9 @@ mod tests {
             nonce: "c_exp".to_string(),
             action_type: "deleteDatabase".to_string(),
             params,
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![STANDARD.encode(spki.as_bytes())]),
+            tenant_id: None,
         };
         // Fail-closed by default.
         assert!(verify_approval_receipt(&receipt, &expected).is_err());
@@ -3179,7 +3896,9 @@ mod tests {
             nonce: "c_nonce_1".to_string(),
             action_type: "deleteDatabase".to_string(),
             params: json!({ "environment": "production" }),
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![]),
+            tenant_id: None,
         };
         let opted_in = VerifyOptions {
             allow_auto_approved: true,
@@ -3196,7 +3915,9 @@ mod tests {
             nonce: "c_nonce_1".to_string(),
             action_type: "listFiles".to_string(),
             params: approved_params,
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![]),
+            tenant_id: None,
         };
         // Refused by default even when the action lines up.
         assert!(verify_approval_receipt(&receipt, &matching).is_err());
@@ -3263,7 +3984,9 @@ mod tests {
             nonce: "off-window-test".to_string(),
             action_type: "deleteDatabase".to_string(),
             params,
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![pub_b64]),
+            tenant_id: None,
         };
         (receipt, expected)
     }
@@ -3380,6 +4103,217 @@ mod tests {
         assert_eq!(from_runtime, from_json_text);
     }
 
+    /// `serde_json` without `float_roundtrip` used to parse this signed JSON number to a nearby
+    /// binary float and re-emit different decimal bytes. V2 then amplified the bug by serializing
+    /// v1, parsing those bytes, adding tenantId, and serializing again. Every parameter-bearing
+    /// builder must construct one `Value` and serialize it once for either version.
+    #[test]
+    fn test_fractional_params_are_byte_stable_in_v1_and_v2_builders() {
+        let parsed: Value = serde_json::from_str(r#"{"fraction":0.30000000000000004}"#).unwrap();
+        assert_eq!(
+            stable_stringify(&parsed).unwrap(),
+            r#"{"fraction":0.30000000000000004}"#,
+            "the float_roundtrip feature must preserve signed JSON number text at ingress"
+        );
+
+        let requester = RequesterIdentity {
+            did: "did:intyga:service:float-boundary".into(),
+            attestation: None,
+        };
+        let requirement = default_requirement();
+        let tenant = Some("tenant-float");
+        let context = json!({
+            "action": { "id": "call-1" },
+            "agent": { "did": "did:intyga:agent:float-boundary" },
+            "session": { "id": "session-1" },
+            "nbf": "2026-01-01T00:00:00Z",
+        });
+
+        let ordinary_v1 = canonical_intent_payload(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:30:00Z",
+        )
+        .unwrap();
+        let ordinary_v1_via_versioned = canonical_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:30:00Z",
+            None,
+        )
+        .unwrap();
+        let ordinary_v2 = canonical_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:30:00Z",
+            tenant,
+        )
+        .unwrap();
+
+        let agent_v1 = canonical_agent_intent_payload(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:30:00Z",
+            &context,
+        )
+        .unwrap();
+        let agent_v1_via_versioned = canonical_agent_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:30:00Z",
+            &context,
+            None,
+        )
+        .unwrap();
+        let agent_v2 = canonical_agent_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:30:00Z",
+            &context,
+            tenant,
+        )
+        .unwrap();
+
+        let offline_v1 = canonical_offline_intent_payload(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:30:00Z",
+        )
+        .unwrap();
+        let offline_v1_via_versioned = canonical_offline_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:30:00Z",
+            None,
+        )
+        .unwrap();
+        let offline_v2 = canonical_offline_intent_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            "n",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:30:00Z",
+            tenant,
+        )
+        .unwrap();
+
+        let delegated_to = ["did:intyga:user:operator".into()];
+        let delegation_v1 = canonical_delegation_payload(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            &delegated_to,
+            1,
+            "n",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:30:00Z",
+        )
+        .unwrap();
+        let delegation_v1_via_versioned = canonical_delegation_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            &delegated_to,
+            1,
+            "n",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:30:00Z",
+            None,
+        )
+        .unwrap();
+        let delegation_v2 = canonical_delegation_payload_with_tenant(
+            "target",
+            "act",
+            "Act",
+            &parsed,
+            &requester,
+            &requirement,
+            &delegated_to,
+            1,
+            "n",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:30:00Z",
+            tenant,
+        )
+        .unwrap();
+
+        for (direct_v1, versioned_v1) in [
+            (&ordinary_v1, &ordinary_v1_via_versioned),
+            (&agent_v1, &agent_v1_via_versioned),
+            (&offline_v1, &offline_v1_via_versioned),
+            (&delegation_v1, &delegation_v1_via_versioned),
+        ] {
+            assert_eq!(direct_v1, versioned_v1, "None must preserve exact v1 bytes");
+        }
+        for payload in [
+            ordinary_v1,
+            ordinary_v2,
+            agent_v1,
+            agent_v2,
+            offline_v1,
+            offline_v2,
+            delegation_v1,
+            delegation_v2,
+        ] {
+            assert!(
+                payload.contains(r#""params":{"fraction":0.30000000000000004}"#),
+                "fractional params drifted: {payload}"
+            );
+        }
+    }
+
     /// Parity with `isPortableNumber` (@intyga/mcp-schemas) / `NonCanonicalValue` (@intyga/verify):
     /// numbers whose canonical form diverges across the TS/Go/Rust/Python ports are REFUSED rather
     /// than serialized. serde_json would print several of these exactly — which is precisely the
@@ -3481,7 +4415,9 @@ mod tests {
             nonce: base.nonce,
             action_type: base.action_type,
             params: json!({ "environment": "staging", "amount": 1e16 }),
+            requester_did: None,
             approvers: base.approvers,
+            tenant_id: None,
         };
         let err = verify_approval_receipt(&receipt, &expected).expect_err("must fail closed");
         assert!(
@@ -3499,7 +4435,7 @@ mod tests {
     /// The single valid witness of `signed_receipt`, as an explicit list entry.
     fn witness_of(receipt: &ApprovalReceipt) -> ApprovalWitness {
         ApprovalWitness {
-            signer_did: receipt.signer_did.clone().unwrap_or_default(),
+            signer_did: Some(receipt.signer_did.clone().unwrap_or_default()),
             signer_public_key: receipt.signer_public_key.clone().unwrap_or_default(),
             signature: receipt.signature.clone().unwrap_or_default(),
             sig_alg: receipt.sig_alg.clone(),
@@ -3588,6 +4524,7 @@ mod tests {
             params,
             // DID mode: delegations refuse a key-set anchor outright (DIV §4.4.6), so the sealing
             // fixture must resolve identities the way a real deployment does.
+            requester_did: None,
             approvers: ApproverTrustAnchor::Dids {
                 dids: vec!["did:intyga:human:alice".to_string()],
                 resolve: Box::new(move |did| {
@@ -3598,6 +4535,7 @@ mod tests {
                     }
                 }),
             },
+            tenant_id: None,
         };
         (receipt, expected)
     }
@@ -3634,7 +4572,7 @@ mod tests {
         let (mut receipt, expected) = signed_receipt();
         let garbage: Vec<ApprovalWitness> = (0..MAX_WITNESSES)
             .map(|i| ApprovalWitness {
-                signer_did: format!("did:intyga:unknown-{i}"),
+                signer_did: Some(format!("did:intyga:unknown-{i}")),
                 signer_public_key: "not-a-key".to_string(),
                 signature: STANDARD.encode(b"garbage-signature"),
                 sig_alg: Some("ES256".to_string()),
@@ -3743,7 +4681,9 @@ mod tests {
             nonce: parse_nonce(&receipt.canonical_payload),
             action_type: receipt.action_type.clone().unwrap_or_default(),
             params: receipt.params.clone(),
+            requester_did: None,
             approvers,
+            tenant_id: None,
         }
     }
 
@@ -3853,6 +4793,7 @@ mod tests {
             },
         );
         let mut delegation = VerifiedDelegation {
+            requester_did: receipt.requester.as_ref().unwrap().did.clone(),
             delegated_to: vec![did],
             delegated_quorum: 1,
             target: expected.target.clone(),
@@ -3962,7 +4903,9 @@ mod tests {
             nonce: "n".to_string(),
             action_type: "x".to_string(),
             params: serde_json::json!({}),
+            requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec!["a-listed-key".to_string()]),
+            tenant_id: None,
         };
         let err = verify_delegation(&receipt, &expected, &VerifyOptions::default()).unwrap_err();
         assert!(err.contains("§4.4.6"), "{err}");

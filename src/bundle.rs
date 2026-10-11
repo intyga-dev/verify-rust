@@ -177,7 +177,8 @@ impl<'a, F: Fn(&SignedAnchor) -> Option<String>> Default for BundleVerifyOptions
             resolve_anchor_key: None,
             external_keys: ExternalAnchorKeys::default(),
             trusted_checkpoint: None,
-            signature_policy: None, require_signatures: false,
+            signature_policy: None,
+            require_signatures: false,
         }
     }
 }
@@ -197,38 +198,116 @@ pub struct AuditSignatureCheck {
     pub trusted: bool,
 }
 fn signature_result(status: &str, reason: &str, trusted: bool) -> AuditSignatureCheck {
-    AuditSignatureCheck {status:status.into(),reason:reason.into(),trusted}
+    AuditSignatureCheck {
+        status: status.into(),
+        reason: reason.into(),
+        trusted,
+    }
 }
-fn unchecked_signature() -> AuditSignatureCheck { signature_result("not_checked", "Content not verified or unavailable.",false) }
-pub fn verify_audit_signature(c: &Value, policy: Option<&AuditSignaturePolicy>) -> AuditSignatureCheck {
-    let result=|s,r| signature_result(s,r,false);
-    let alg=c["sigAlg"].as_str().unwrap_or("");
-    if alg.is_empty() && ["signature","signedPayload","signerPublicKey"].iter().any(|k|c[*k].as_str().is_some_and(|s|!s.is_empty())) { return result("not_checked", "Signature algorithm is missing.") }
-    if alg.is_empty() || alg=="AUTO_APPROVED" { return result("not_applicable", "No human signature is declared.") }
-    if alg!="ES256" && alg!="WEBAUTHN" { return result("not_checked", "Unsupported signature algorithm.") }
-    let present=|v: &Value| v.as_str().is_some_and(|s|!s.is_empty());
-    if !present(&c["signature"]) || !present(&c["signedPayload"]) { return result("not_checked", "Signature or signed payload is missing.") }
-    if policy.is_none() && alg=="ES256" {
-        if !present(&c["signerPublicKey"]) { return result("not_checked", "Signer public key is missing.") }
-        return if verify_embedded_signature(c) { result("verified", "Signature valid under embedded key; signer identity is not established.") } else { result("invalid", "Signature does not verify.") };
+fn unchecked_signature() -> AuditSignatureCheck {
+    signature_result("not_checked", "Content not verified or unavailable.", false)
+}
+pub fn verify_audit_signature(
+    c: &Value,
+    policy: Option<&AuditSignaturePolicy>,
+) -> AuditSignatureCheck {
+    let result = |s, r| signature_result(s, r, false);
+    let alg = c["sigAlg"].as_str().unwrap_or("");
+    if alg.is_empty()
+        && ["signature", "signedPayload", "signerPublicKey"]
+            .iter()
+            .any(|k| c[*k].as_str().is_some_and(|s| !s.is_empty()))
+    {
+        return result("not_checked", "Signature algorithm is missing.");
     }
-    let keys=policy.and_then(|p| c["signerDid"].as_str().and_then(|did|p.trusted_signers.get(did)));
-    let Some(keys)=keys.filter(|ks|!ks.is_empty() && ks.iter().all(|k|!k.is_empty())) else { return result("not_checked", "No caller-trusted key for this signer.") };
-    let p=policy.unwrap();
-    if alg=="WEBAUTHN" && (p.expected_origin.as_deref().unwrap_or("").is_empty() || p.expected_rp_id.as_deref().unwrap_or("").is_empty()) { return result("not_checked", "Caller-selected WebAuthn origin and RP ID are required.") }
-    let w=&c["metadata"]["webauthn"];
-    if alg=="WEBAUTHN" && (!present(&w["authenticatorData"]) || !present(&w["clientDataJSON"])) { return result("not_checked", "WebAuthn authenticatorData or clientDataJSON is missing.") }
-    for key in keys {
-        let valid=if alg=="ES256" {
-            let mut clone=c.clone();clone["signerPublicKey"]=Value::String(key.clone());verify_embedded_signature(&clone)
+    if alg.is_empty() || alg == "AUTO_APPROVED" {
+        return result("not_applicable", "No human signature is declared.");
+    }
+    if alg != "ES256" && alg != "WEBAUTHN" {
+        return result("not_checked", "Unsupported signature algorithm.");
+    }
+    let present = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
+    if !present(&c["signature"]) || !present(&c["signedPayload"]) {
+        return result("not_checked", "Signature or signed payload is missing.");
+    }
+    if policy.is_none() && alg == "ES256" {
+        if !present(&c["signerPublicKey"]) {
+            return result("not_checked", "Signer public key is missing.");
+        }
+        return if verify_embedded_signature(c) {
+            result(
+                "verified",
+                "Signature valid under embedded key; signer identity is not established.",
+            )
         } else {
-            let witness=crate::ApprovalWitness {signer_did:String::new(),signer_public_key:key.clone(), signature:c["signature"].as_str().unwrap().into(),sig_alg:Some("WEBAUTHN".into()),authenticator_data:w["authenticatorData"].as_str().map(str::to_string),client_data_json:w["clientDataJSON"].as_str().map(str::to_string)};
-            let receipt:crate::ApprovalReceipt=serde_json::from_value(serde_json::json!({"canonicalPayload":c["signedPayload"],"actionDescription":"","params":{},"verificationCode":""})).expect("static receipt shape");
-            crate::webauthn::verify_webauthn_witness(&witness,key,&receipt,&crate::VerifyOptions{expected_origin:p.expected_origin.clone(),expected_rp_id:p.expected_rp_id.clone(),require_user_verification:Some(true),..Default::default()}).is_ok()
+            result("invalid", "Signature does not verify.")
         };
-        if valid { return signature_result("verified", "Signature valid under caller-trusted signer key.",true) }
     }
-    result("invalid", "Signature or WebAuthn assertion does not verify under caller trust.")
+    let keys = policy.and_then(|p| {
+        c["signerDid"]
+            .as_str()
+            .and_then(|did| p.trusted_signers.get(did))
+    });
+    let Some(keys) = keys.filter(|ks| !ks.is_empty() && ks.iter().all(|k| !k.is_empty())) else {
+        return result("not_checked", "No caller-trusted key for this signer.");
+    };
+    let p = policy.unwrap();
+    if alg == "WEBAUTHN"
+        && (p.expected_origin.as_deref().unwrap_or("").is_empty()
+            || p.expected_rp_id.as_deref().unwrap_or("").is_empty())
+    {
+        return result(
+            "not_checked",
+            "Caller-selected WebAuthn origin and RP ID are required.",
+        );
+    }
+    let w = &c["metadata"]["webauthn"];
+    if alg == "WEBAUTHN" && (!present(&w["authenticatorData"]) || !present(&w["clientDataJSON"])) {
+        return result(
+            "not_checked",
+            "WebAuthn authenticatorData or clientDataJSON is missing.",
+        );
+    }
+    for key in keys {
+        let valid = if alg == "ES256" {
+            let mut clone = c.clone();
+            clone["signerPublicKey"] = Value::String(key.clone());
+            verify_embedded_signature(&clone)
+        } else {
+            let witness = crate::ApprovalWitness {
+                signer_did: Some(String::new()),
+                signer_public_key: key.clone(),
+                signature: c["signature"].as_str().unwrap().into(),
+                sig_alg: Some("WEBAUTHN".into()),
+                authenticator_data: w["authenticatorData"].as_str().map(str::to_string),
+                client_data_json: w["clientDataJSON"].as_str().map(str::to_string),
+            };
+            let receipt:crate::ApprovalReceipt=serde_json::from_value(serde_json::json!({"canonicalPayload":c["signedPayload"],"actionDescription":"","params":{},"verificationCode":""})).expect("static receipt shape");
+            crate::webauthn::verify_webauthn_witness(
+                &witness,
+                key,
+                &receipt,
+                &crate::VerifyOptions {
+                    expected_origin: p.expected_origin.clone(),
+                    expected_rp_id: p.expected_rp_id.clone(),
+                    require_user_verification: Some(true),
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+        };
+        if valid {
+            return signature_result(
+                "verified",
+                "Signature valid under caller-trusted signer key.",
+                true,
+            );
+        }
+    }
+    result(
+        "invalid",
+        "Signature or WebAuthn assertion does not verify under caller trust.",
+    )
 }
 pub fn verify_embedded_signature(c: &Value) -> bool {
     if c["sigAlg"].as_str() != Some("ES256") {
@@ -288,7 +367,12 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
     o: &BundleVerifyOptions<F>,
 ) -> BundleVerification {
     let mut notes = Vec::new();
-    let kind_ok = b.kind == BUNDLE_KIND && supported_envelope(b.protocol.as_deref(), &b.version, b.algorithm_registry.as_ref());
+    let kind_ok = b.kind == BUNDLE_KIND
+        && supported_envelope(
+            b.protocol.as_deref(),
+            &b.version,
+            b.algorithm_registry.as_ref(),
+        );
     if !kind_ok {
         notes.push(format!(
             "Refusing bundle kind {:?} (expected {BUNDLE_KIND:?}) — DEWP §6.5.",
@@ -306,7 +390,10 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
     if conflict {
         notes.push("The supplied trusted checkpoint names a different root than the trusted root; refusing to pick one.".into());
     }
-    let caller_root = o.trusted_root.clone().or_else(|| tc.map(|t| t.root.clone()));
+    let caller_root = o
+        .trusted_root
+        .clone()
+        .or_else(|| tc.map(|t| t.root.clone()));
     let (root, source) = if let Some(r) = &caller_root {
         (Some(r.clone()), "caller-supplied")
     } else if self_root.is_some() {
@@ -327,7 +414,9 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
     if let Some(m) = &count_mismatch {
         notes.push(m.clone());
     }
-    let inc = root.as_ref().map(|r| count_mismatch.is_none() && b.proof.verify(r));
+    let inc = root
+        .as_ref()
+        .map(|r| count_mismatch.is_none() && b.proof.verify(r));
     let inclusion = check(
         inc,
         "Event leaf recomputes to the daily root.",
@@ -367,8 +456,15 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
     );
     let commitment = inc == Some(true) && consistency == Some(true);
     let content = commitment && leaf == Some(true) && header != Some(false);
-    let signature_check=if content { verify_audit_signature(b.event.canonical.as_ref().unwrap(),o.signature_policy.as_ref()) } else { unchecked_signature() };
-    let signature=signature_check.status=="verified";
+    let signature_check = if content {
+        verify_audit_signature(
+            b.event.canonical.as_ref().unwrap(),
+            o.signature_policy.as_ref(),
+        )
+    } else {
+        unchecked_signature()
+    };
+    let signature = signature_check.status == "verified";
     let has_signer = signature_check.status != "not_applicable";
     let mut anchor_verified = false;
     let mut divergence = false;
@@ -430,7 +526,10 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
         && leaf != Some(false)
         && header != Some(false)
         && (!b.event.canonical.is_some() || leaf == Some(true));
-    let ok = base && !divergence && (o.anchor_policy.is_none() || anchor_verified) && (!o.require_signatures || (signature && signature_check.trusted));
+    let ok = base
+        && !divergence
+        && (o.anchor_policy.is_none() || anchor_verified)
+        && (!o.require_signatures || (signature && signature_check.trusted));
     BundleVerification {
         signature: signature_check,
         ok,
@@ -613,7 +712,8 @@ fn effective_checkpoint(
             chain_hash: pick(t.map(|t| &t.chain_hash), c.map(|c| &c.chain_hash)),
             anchored_at: pick(t.map(|t| &t.anchored_at), c.map(|c| &c.anchored_at)),
         },
-        t.and_then(|t| t.entry_count).or_else(|| c.and_then(|c| c.entry_count)),
+        t.and_then(|t| t.entry_count)
+            .or_else(|| c.and_then(|c| c.entry_count)),
     )
 }
 
@@ -621,20 +721,35 @@ fn verify_evidence_entries(
     b: &EvidenceBundle,
     trusted_roots: Option<&[String]>,
     trusted_checkpoints: Option<&[ledger::TrustedCheckpoint]>,
-    signature_policy: Option<&AuditSignaturePolicy>, require_signatures: bool,
+    signature_policy: Option<&AuditSignaturePolicy>,
+    require_signatures: bool,
 ) -> EvidenceVerification {
     let mut r = EvidenceVerification {
         total: b.entries.len(),
         ..Default::default()
     };
-    if b.kind != EVIDENCE_BUNDLE_KIND || !supported_envelope(b.protocol.as_deref(), &b.version, b.algorithm_registry.as_ref()) {
+    if b.kind != EVIDENCE_BUNDLE_KIND
+        || !supported_envelope(
+            b.protocol.as_deref(),
+            &b.version,
+            b.algorithm_registry.as_ref(),
+        )
+    {
         r.failed.push(("-".into(), "refusing bundle kind".into()))
     }
     // §5.4 chain fields, where carried: the chain hash every anchor binds must recompute.
     for c in &b.checkpoints {
-        let Some(claimed) = &c.chain_hash else { continue };
+        let Some(claimed) = &c.chain_hash else {
+            continue;
+        };
         let id = c.id.as_deref().unwrap_or("?");
-        match (&c.prev_chain_hash, &c.anchored_at, c.entry_count, &c.seq_start, &c.seq_end) {
+        match (
+            &c.prev_chain_hash,
+            &c.anchored_at,
+            c.entry_count,
+            &c.seq_start,
+            &c.seq_end,
+        ) {
             (Some(prev), Some(at), Some(count), Some(start), Some(end)) => {
                 let recomputed = crate::chain::chain_hash(&crate::chain::ChainInput {
                     prev_chain_hash: prev.clone(),
@@ -645,10 +760,16 @@ fn verify_evidence_entries(
                     anchored_at: at.clone(),
                 });
                 if &recomputed != claimed {
-                    r.failed.push(("-".into(), format!("checkpoint {id} chainHash does not recompute")));
+                    r.failed.push((
+                        "-".into(),
+                        format!("checkpoint {id} chainHash does not recompute"),
+                    ));
                 }
             }
-            _ => r.failed.push(("-".into(), format!("checkpoint {id} chainHash lacks the fields it commits to"))),
+            _ => r.failed.push((
+                "-".into(),
+                format!("checkpoint {id} chainHash lacks the fields it commits to"),
+            )),
         }
     }
     let mut records = std::collections::BTreeMap::<&str, &ledger::TrustedCheckpoint>::new();
@@ -658,13 +779,18 @@ fn verify_evidence_entries(
     // A checkpoint the caller holds a record for must agree with it on every field both state: a
     // re-dated anchoredAt with a self-consistent chain over a made-up predecessor recomputes above.
     for c in &b.checkpoints {
-        let Some(t) = records.get(c.root.as_str()) else { continue };
+        let Some(t) = records.get(c.root.as_str()) else {
+            continue;
+        };
         let differs = |shown: &Option<String>, held: &Option<String>| matches!((shown, held), (Some(s), Some(h)) if s != h);
         let id = c.id.as_deref().unwrap_or("?");
         for (field, bad) in [
             ("seqStart", differs(&c.seq_start, &t.seq_start)),
             ("seqEnd", differs(&c.seq_end, &t.seq_end)),
-            ("entryCount", matches!((c.entry_count, t.entry_count), (Some(s), Some(h)) if s != h)),
+            (
+                "entryCount",
+                matches!((c.entry_count, t.entry_count), (Some(s), Some(h)) if s != h),
+            ),
             ("anchoredAt", differs(&c.anchored_at, &t.anchored_at)),
             ("chainHash", differs(&c.chain_hash, &t.chain_hash)),
         ] {
@@ -730,7 +856,11 @@ fn verify_evidence_entries(
         let count_bad = if inconsistent {
             Some("proofs into the same block or checkpoint disagree on its leaf count".to_string())
         } else {
-            ledger::leaf_count_mismatch(e.proof.block_leaf_count, e.proof.checkpoint_leaf_count, entry_count)
+            ledger::leaf_count_mismatch(
+                e.proof.block_leaf_count,
+                e.proof.checkpoint_leaf_count,
+                entry_count,
+            )
         };
         if let Some(reason) = count_bad {
             r.failed.push((e.event.seq.clone(), reason));
@@ -744,7 +874,8 @@ fn verify_evidence_entries(
                 // passing it would let the producer switch leaf binding off (DEWP §4.5/§7.2 rule 1).
                 r.failed.push((
                     e.event.seq.clone(),
-                    "canonical preimage under an unknown profile cannot be bound to its leaf".into(),
+                    "canonical preimage under an unknown profile cannot be bound to its leaf"
+                        .into(),
                 ));
                 continue;
             } else if ledger::leaf_hash(c) != e.proof.leaf {
@@ -795,9 +926,15 @@ fn verify_evidence_entries(
                     }
                 }
                 r.content_verified += 1;
-                let check=verify_audit_signature(c,signature_policy);
-                if check.status=="verified" { r.signatures.verified+=1; } else if check.status=="invalid" { r.signatures.invalid.push(e.event.seq.clone()); } else { r.signatures.not_checkable+=1; }
-                r.signatures.checks.push((e.event.seq.clone(),check));
+                let check = verify_audit_signature(c, signature_policy);
+                if check.status == "verified" {
+                    r.signatures.verified += 1;
+                } else if check.status == "invalid" {
+                    r.signatures.invalid.push(e.event.seq.clone());
+                } else {
+                    r.signatures.not_checkable += 1;
+                }
+                r.signatures.checks.push((e.event.seq.clone(), check));
             }
         } else if match e.event.redaction.as_ref() {
             Some(redaction) => redaction.mode == "COMMITMENT_ONLY",
@@ -929,9 +1066,30 @@ fn verify_evidence_entries(
             _ => r.notes.push("Bundle declares a tenantSequenceCommitment but no entry carries a tenantSeq to check it against.".into()),
         }
     }
-    let by_seq:std::collections::BTreeMap<_,_>=r.signatures.checks.iter().cloned().collect();
-    r.signatures.checks=b.entries.iter().map(|e| (e.event.seq.clone(),by_seq.get(&e.event.seq).cloned().unwrap_or_else(unchecked_signature))).collect();
-    if require_signatures { for (seq,check) in &r.signatures.checks { if check.status!="verified" || !check.trusted { r.failed.push((seq.clone(),format!("Required trusted signature: {}",check.reason))); } } }
+    let by_seq: std::collections::BTreeMap<_, _> = r.signatures.checks.iter().cloned().collect();
+    r.signatures.checks = b
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.event.seq.clone(),
+                by_seq
+                    .get(&e.event.seq)
+                    .cloned()
+                    .unwrap_or_else(unchecked_signature),
+            )
+        })
+        .collect();
+    if require_signatures {
+        for (seq, check) in &r.signatures.checks {
+            if check.status != "verified" || !check.trusted {
+                r.failed.push((
+                    seq.clone(),
+                    format!("Required trusted signature: {}", check.reason),
+                ));
+            }
+        }
+    }
     r.roots = b
         .checkpoints
         .iter()
@@ -975,11 +1133,17 @@ mod parity_tests {
     }
     fn external_from(options: &Value, keys: &Value) -> ExternalAnchorKeys {
         ExternalAnchorKeys {
-            rekor: options["rekorKeyId"].as_str().and_then(|id| key_spki(keys, id)),
+            rekor: options["rekorKeyId"]
+                .as_str()
+                .and_then(|id| key_spki(keys, id)),
             rekor_issuer: options["rekorIssuer"].as_str().map(str::to_owned),
             rekor_submitter_keys: options["rekorSubmitterKeyIds"]
                 .as_array()
-                .map(|ids| ids.iter().filter_map(|id| id.as_str().and_then(|id| key_spki(keys, id))).collect())
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().and_then(|id| key_spki(keys, id)))
+                        .collect()
+                })
                 .unwrap_or_default(),
             ..Default::default()
         }
@@ -988,9 +1152,12 @@ mod parity_tests {
     fn run_evidence_cases(cases: &Value, keys: &Value) {
         for c in cases.as_array().unwrap() {
             let b: EvidenceBundle = serde_json::from_value(c["bundle"].clone()).unwrap();
-            let roots: Option<Vec<String>> = c["options"]["trustedRoots"]
-                .as_array()
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect());
+            let roots: Option<Vec<String>> = c["options"]["trustedRoots"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            });
             let records: Option<Vec<ledger::TrustedCheckpoint>> = c["options"]
                 .get("trustedCheckpoints")
                 .map(|v| serde_json::from_value(v.clone()).unwrap());
@@ -1003,7 +1170,8 @@ mod parity_tests {
                 }
             });
             let opts = EvidenceVerifyOptions {
-                signature_policy: None, require_signatures: false,
+                signature_policy: None,
+                require_signatures: false,
                 trusted_roots: roots.as_deref(),
                 anchors,
                 anchor_policy: c.get("policy").map(policy_from),
@@ -1012,7 +1180,14 @@ mod parity_tests {
                 trusted_checkpoints: records.as_deref(),
             };
             let got = verify_evidence_bundle_with_options(&b, &opts);
-            assert_eq!(got.ok, c["ok"].as_bool().unwrap(), "evidence {}: {:?} {:?}", c["name"], got.failed, got.notes);
+            assert_eq!(
+                got.ok,
+                c["ok"].as_bool().unwrap(),
+                "evidence {}: {:?} {:?}",
+                c["name"],
+                got.failed,
+                got.notes
+            );
             if let Some(n) = c.get("total").and_then(Value::as_u64) {
                 assert_eq!(got.total, n as usize, "{}", c["name"]);
             }
@@ -1032,7 +1207,8 @@ mod parity_tests {
             let b: ProofBundle = serde_json::from_value(c["bundle"].clone()).unwrap();
             let resolver = |a: &SignedAnchor| key_spki(keys, &a.key_id);
             let o = BundleVerifyOptions {
-                signature_policy: None, require_signatures: false,
+                signature_policy: None,
+                require_signatures: false,
                 trusted_root: c["options"]["trustedRoot"].as_str().map(str::to_owned),
                 anchors: c["options"]
                     .get("divergenceAnchors")
@@ -1063,8 +1239,10 @@ mod parity_tests {
                 assert_eq!(actual, expected, "{}", c["name"]);
             }
             if let Some(want) = c["witnessTimes"].as_object() {
-                let want: std::collections::BTreeMap<String, i64> =
-                    want.iter().map(|(k, v)| (k.clone(), v.as_i64().unwrap())).collect();
+                let want: std::collections::BTreeMap<String, i64> = want
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_i64().unwrap()))
+                    .collect();
                 assert_eq!(got.witness_times, want, "bundle {} witnessTimes", c["name"]);
             }
             if let Some(properties) = c["properties"].as_object() {
@@ -1121,7 +1299,11 @@ mod parity_tests {
                 );
             }
         }
-        run_bundle_cases(&v["bundles"]["cases"], &v["keys"], Some(&v["bundles"]["anchorPolicy"]));
+        run_bundle_cases(
+            &v["bundles"]["cases"],
+            &v["keys"],
+            Some(&v["bundles"]["anchorPolicy"]),
+        );
         // The DEWP evidence-hardening section carries its own keys.
         let h = &v["dewpEvidenceHardening"];
         assert!(!h["bundles"]["cases"].as_array().unwrap().is_empty());
@@ -1137,25 +1319,80 @@ mod parity_tests {
 
     #[test]
     fn external_rfc3161_trust_does_not_require_self_key_resolver() {
-        let parity: Value = serde_json::from_str(include_str!("../vectors/verifier-parity-vectors.json")).unwrap();
-        let rfc: Value = serde_json::from_str(include_str!("../vectors/rfc3161-vectors.json")).unwrap();
-        let mut anchor: SignedAnchor = serde_json::from_value(rfc["cases"][2]["anchor"].clone()).unwrap();
+        let parity: Value = serde_json::from_str(include_str!(
+            "../vectors/verifier-parity-vectors.json"
+        ))
+        .unwrap();
+        let rfc: Value = serde_json::from_str(include_str!(
+            "../vectors/rfc3161-vectors.json"
+        ))
+        .unwrap();
+        let mut anchor: SignedAnchor =
+            serde_json::from_value(rfc["cases"][2]["anchor"].clone()).unwrap();
         let trust: Rfc3161Trust = serde_json::from_value(rfc["cases"][0]["trust"].clone()).unwrap();
-        let issuer=anchor.issuer.clone();let policy=AnchorPolicy{required_anchors:1,trusted_issuers:vec![issuer.clone()],quorum:ledger::AnchorQuorum::NOfM,max_anchor_lag_seconds:None};
-        let mut external=ExternalAnchorKeys::default();external.rfc3161.insert(issuer,trust);
+        let issuer = anchor.issuer.clone();
+        let policy = AnchorPolicy {
+            required_anchors: 1,
+            trusted_issuers: vec![issuer.clone()],
+            quorum: ledger::AnchorQuorum::NOfM,
+            max_anchor_lag_seconds: None,
+        };
+        let mut external = ExternalAnchorKeys::default();
+        external.rfc3161.insert(issuer, trust);
 
-        let bundle:ProofBundle=serde_json::from_value(parity["bundles"]["cases"][0]["bundle"].clone()).unwrap();
-        anchor.daily_root=bundle.proof.checkpoint_root.clone().unwrap();
-        let options:BundleVerifyOptions<'_,fn(&SignedAnchor)->Option<String>>=BundleVerifyOptions{signature_policy:None,require_signatures:false,trusted_root:Some(anchor.daily_root.clone()),anchors:Some(vec![anchor.clone()]),anchor_policy:Some(policy.clone()),resolve_anchor_key:None,external_keys:external.clone(),trusted_checkpoint:None};
-        let got=verify_bundle(&bundle,&options);assert!(got.notes.iter().any(|n|n.contains("not verified")),"{:?}",got.notes);
+        let bundle: ProofBundle =
+            serde_json::from_value(parity["bundles"]["cases"][0]["bundle"].clone()).unwrap();
+        anchor.daily_root = bundle.proof.checkpoint_root.clone().unwrap();
+        let options: BundleVerifyOptions<'_, fn(&SignedAnchor) -> Option<String>> =
+            BundleVerifyOptions {
+                signature_policy: None,
+                require_signatures: false,
+                trusted_root: Some(anchor.daily_root.clone()),
+                anchors: Some(vec![anchor.clone()]),
+                anchor_policy: Some(policy.clone()),
+                resolve_anchor_key: None,
+                external_keys: external.clone(),
+                trusted_checkpoint: None,
+            };
+        let got = verify_bundle(&bundle, &options);
+        assert!(
+            got.notes.iter().any(|n| n.contains("not verified")),
+            "{:?}",
+            got.notes
+        );
 
-        let evidence:EvidenceBundle=serde_json::from_value(parity["evidence"]["cases"][0]["bundle"].clone()).unwrap();
-        let roots=evidence.checkpoints.iter().map(|c|c.root.clone()).collect::<Vec<_>>();anchor.daily_root=roots[0].clone();
+        let evidence: EvidenceBundle =
+            serde_json::from_value(parity["evidence"]["cases"][0]["bundle"].clone()).unwrap();
+        let roots = evidence
+            .checkpoints
+            .iter()
+            .map(|c| c.root.clone())
+            .collect::<Vec<_>>();
+        anchor.daily_root = roots[0].clone();
         // Hold the (tampered) TSA anchor to this checkpoint's position so it is the token, not the
         // position, that fails — the note under test is about unverifiable evidence.
-        let cp=&evidence.checkpoints[0];anchor.seq_start=cp.seq_start.clone().unwrap();anchor.seq_end=cp.seq_end.clone().unwrap();anchor.chain_hash=cp.chain_hash.clone().unwrap();anchor.timestamp=cp.anchored_at.clone().unwrap();
-        let options:EvidenceVerifyOptions<'_,fn(&SignedAnchor)->Option<String>>=EvidenceVerifyOptions{signature_policy:None,require_signatures:false,trusted_roots:Some(&roots),anchors:Some(EvidenceAnchorSet::Flat(vec![anchor])),anchor_policy:Some(policy),resolve_anchor_key:None,external_keys:external,trusted_checkpoints:None};
-        let got=verify_evidence_bundle_with_options(&evidence,&options);assert!(got.notes.iter().any(|n|n.contains("not verified")),"{:?}",got.notes);
+        let cp = &evidence.checkpoints[0];
+        anchor.seq_start = cp.seq_start.clone().unwrap();
+        anchor.seq_end = cp.seq_end.clone().unwrap();
+        anchor.chain_hash = cp.chain_hash.clone().unwrap();
+        anchor.timestamp = cp.anchored_at.clone().unwrap();
+        let options: EvidenceVerifyOptions<'_, fn(&SignedAnchor) -> Option<String>> =
+            EvidenceVerifyOptions {
+                signature_policy: None,
+                require_signatures: false,
+                trusted_roots: Some(&roots),
+                anchors: Some(EvidenceAnchorSet::Flat(vec![anchor])),
+                anchor_policy: Some(policy),
+                resolve_anchor_key: None,
+                external_keys: external,
+                trusted_checkpoints: None,
+            };
+        let got = verify_evidence_bundle_with_options(&evidence, &options);
+        assert!(
+            got.notes.iter().any(|n| n.contains("not verified")),
+            "{:?}",
+            got.notes
+        );
     }
 }
 
@@ -1165,14 +1402,23 @@ pub fn verify_evidence_bundle_with_options<F: Fn(&SignedAnchor) -> Option<String
     b: &EvidenceBundle,
     o: &EvidenceVerifyOptions<F>,
 ) -> EvidenceVerification {
-    let mut r = verify_evidence_entries(b, o.trusted_roots, o.trusted_checkpoints, o.signature_policy.as_ref(), o.require_signatures);
+    let mut r = verify_evidence_entries(
+        b,
+        o.trusted_roots,
+        o.trusted_checkpoints,
+        o.signature_policy.as_ref(),
+        o.require_signatures,
+    );
     let mut by_root = std::collections::BTreeMap::<String, Vec<SignedAnchor>>::new();
-    let mut expected_by_root = std::collections::BTreeMap::<String, ledger::ExpectedCheckpoint>::new();
+    let mut expected_by_root =
+        std::collections::BTreeMap::<String, ledger::ExpectedCheckpoint>::new();
     let mut checkpoint_key_to_root = std::collections::BTreeMap::<String, String>::new();
     for cp in &b.checkpoints {
         by_root.insert(cp.root.clone(), cp.anchors.clone());
         // Anchors are held to the caller's record where it states a field (DEWP §5.3).
-        let record = o.trusted_checkpoints.and_then(|x| x.iter().find(|t| t.root == cp.root));
+        let record = o
+            .trusted_checkpoints
+            .and_then(|x| x.iter().find(|t| t.root == cp.root));
         expected_by_root.insert(cp.root.clone(), effective_checkpoint(Some(cp), record).0);
         if let Some(id) = &cp.id {
             checkpoint_key_to_root.insert(id.clone(), cp.root.clone());
@@ -1247,7 +1493,11 @@ pub fn verify_evidence_bundle_with_options<F: Fn(&SignedAnchor) -> Option<String
             }
             if let Some(x) = r.roots.iter_mut().find(|x| &x.root == root) {
                 x.anchor_verified = Some(q.ok && !position_unknown);
-                x.verified_issuers = if position_unknown { Vec::new() } else { q.verified_issuers.clone() };
+                x.verified_issuers = if position_unknown {
+                    Vec::new()
+                } else {
+                    q.verified_issuers.clone()
+                };
                 x.witness_times = q.witness_times.clone();
             }
             if let Some(note) = q.note.clone() {
@@ -1282,9 +1532,19 @@ pub fn verify_evidence_bundle_with_options<F: Fn(&SignedAnchor) -> Option<String
 
 // DEWP §7/§12: only numeric revisions 1 and 2 without a protocol is a legacy export.
 fn supported_envelope(protocol: Option<&str>, version: &Value, registry: Option<&Value>) -> bool {
-    if protocol.is_some() && protocol != Some("DEWP") { return false; }
-    if version.as_str() != Some("1.0") && !(protocol.is_none() && matches!(version.as_f64(), Some(1.0 | 2.0))) { return false; }
-    registry.map_or(true, |a| a["hashAlgorithm"] == "SHA-256" && a["serialization"] == "RFC8785-JCS" && a["merkleVersion"].as_f64() == Some(1.0))
+    if protocol.is_some() && protocol != Some("DEWP") {
+        return false;
+    }
+    if version.as_str() != Some("1.0")
+        && !(protocol.is_none() && matches!(version.as_f64(), Some(1.0 | 2.0)))
+    {
+        return false;
+    }
+    registry.map_or(true, |a| {
+        a["hashAlgorithm"] == "SHA-256"
+            && a["serialization"] == "RFC8785-JCS"
+            && a["merkleVersion"].as_f64() == Some(1.0)
+    })
 }
 
 fn present_registry<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
@@ -1293,21 +1553,65 @@ fn present_registry<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Val
 
 #[cfg(test)]
 mod audit_signature_tests {
- use super::*;
- #[test] fn audit_signature_parity() {
-  let vectors:Value=serde_json::from_str(include_str!("../vectors/audit-signature-vectors.json")).unwrap();
-  for v in vectors["cases"].as_array().unwrap() {
-   let b:ProofBundle=serde_json::from_value(v["bundle"].clone()).unwrap();
-   let policy:Option<AuditSignaturePolicy>=serde_json::from_value(v["policy"].clone()).unwrap();
-   let mut o:BundleVerifyOptions<fn(&SignedAnchor)->Option<String>>=BundleVerifyOptions{trusted_root:Some(v["root"].as_str().unwrap().into()),signature_policy:policy.clone(),..Default::default()};
-   let got=verify_bundle(&b,&o);assert!(got.ok,"{} {:?}",v["name"],got.notes);
-   assert_eq!(got.signature.status,v["status"].as_str().unwrap(),"{}",v["name"]);assert_eq!(got.signature.trusted,v["trusted"].as_bool().unwrap());
-   o.require_signatures=true;assert_eq!(verify_bundle(&b,&o).ok,v["strictOk"].as_bool().unwrap(),"{}",v["name"]);
-   let evidence:EvidenceBundle=serde_json::from_value(serde_json::json!({"kind":EVIDENCE_BUNDLE_KIND,"version":"1.0","tenant":{"id":"test-tenant"},"entries":[{"event":v["bundle"]["event"],"proof":v["bundle"]["proof"]}],"checkpoints":[{"id":"cp","root":v["root"],"seqStart":"1","seqEnd":"1"}]})).unwrap();
-   let roots=vec![v["root"].as_str().unwrap().to_string()];
-   let mut eo:EvidenceVerifyOptions<fn(&SignedAnchor)->Option<String>>=EvidenceVerifyOptions{trusted_roots:Some(&roots),signature_policy:policy,require_signatures:false,anchors:None,anchor_policy:None,resolve_anchor_key:None,external_keys:ExternalAnchorKeys::default(),trusted_checkpoints:None};
-   let bulk=verify_evidence_bundle_with_options(&evidence,&eo);assert!(bulk.ok,"{} {:?}",v["name"],bulk.failed);assert_eq!(bulk.signatures.checks[0].1.status,v["status"].as_str().unwrap());
-   eo.require_signatures=true;assert_eq!(verify_evidence_bundle_with_options(&evidence,&eo).ok,v["strictOk"].as_bool().unwrap(),"{}",v["name"]);
-  }
- }
+    use super::*;
+    #[test]
+    fn audit_signature_parity() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../vectors/audit-signature-vectors.json"
+        ))
+        .unwrap();
+        for v in vectors["cases"].as_array().unwrap() {
+            let b: ProofBundle = serde_json::from_value(v["bundle"].clone()).unwrap();
+            let policy: Option<AuditSignaturePolicy> =
+                serde_json::from_value(v["policy"].clone()).unwrap();
+            let mut o: BundleVerifyOptions<fn(&SignedAnchor) -> Option<String>> =
+                BundleVerifyOptions {
+                    trusted_root: Some(v["root"].as_str().unwrap().into()),
+                    signature_policy: policy.clone(),
+                    ..Default::default()
+                };
+            let got = verify_bundle(&b, &o);
+            assert!(got.ok, "{} {:?}", v["name"], got.notes);
+            assert_eq!(
+                got.signature.status,
+                v["status"].as_str().unwrap(),
+                "{}",
+                v["name"]
+            );
+            assert_eq!(got.signature.trusted, v["trusted"].as_bool().unwrap());
+            o.require_signatures = true;
+            assert_eq!(
+                verify_bundle(&b, &o).ok,
+                v["strictOk"].as_bool().unwrap(),
+                "{}",
+                v["name"]
+            );
+            let evidence:EvidenceBundle=serde_json::from_value(serde_json::json!({"kind":EVIDENCE_BUNDLE_KIND,"version":"1.0","tenant":{"id":"test-tenant"},"entries":[{"event":v["bundle"]["event"],"proof":v["bundle"]["proof"]}],"checkpoints":[{"id":"cp","root":v["root"],"seqStart":"1","seqEnd":"1"}]})).unwrap();
+            let roots = vec![v["root"].as_str().unwrap().to_string()];
+            let mut eo: EvidenceVerifyOptions<fn(&SignedAnchor) -> Option<String>> =
+                EvidenceVerifyOptions {
+                    trusted_roots: Some(&roots),
+                    signature_policy: policy,
+                    require_signatures: false,
+                    anchors: None,
+                    anchor_policy: None,
+                    resolve_anchor_key: None,
+                    external_keys: ExternalAnchorKeys::default(),
+                    trusted_checkpoints: None,
+                };
+            let bulk = verify_evidence_bundle_with_options(&evidence, &eo);
+            assert!(bulk.ok, "{} {:?}", v["name"], bulk.failed);
+            assert_eq!(
+                bulk.signatures.checks[0].1.status,
+                v["status"].as_str().unwrap()
+            );
+            eo.require_signatures = true;
+            assert_eq!(
+                verify_evidence_bundle_with_options(&evidence, &eo).ok,
+                v["strictOk"].as_bool().unwrap(),
+                "{}",
+                v["name"]
+            );
+        }
+    }
 }
