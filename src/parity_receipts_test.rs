@@ -612,3 +612,185 @@ fn shared_canonical_authority_and_platform_builders() {
         assert_eq!(got, item["expected"].as_str().unwrap());
     }
 }
+
+/// DEWP §4.7 (version 1.1): the shared `executionEvidence` section, run exactly as TS runs it.
+#[test]
+fn shared_execution_evidence_vectors() {
+    use crate::bundle::{verify_bundle_with_evidence, verify_evidence_bundle_with_execution, BundleVerifyOptions, EvidenceBundle, EvidenceVerifyOptions, ProofBundle};
+    use crate::execution::{canonical_execution_evidence_statement, parse_execution_evidence_statement, ExecutionEvidencePolicy, ExecutionEvidenceStatement, ExecutionOptions, SourceContinuity};
+    use crate::ledger::{AnchorPolicy, AnchorQuorum, ExternalAnchorKeys, SignedAnchor};
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/vectors/verifier-parity-vectors.json")).unwrap(),
+    )
+    .unwrap();
+    let section = &vectors["executionEvidence"];
+    let rows = |v: &Value| -> Vec<(String, String, bool)> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["seq"].as_str().unwrap().into(), r["status"].as_str().unwrap().into(), r["trusted"].as_bool().unwrap()))
+            .collect()
+    };
+    let no_resolver = |_: &SignedAnchor| -> Option<String> { None };
+    let cases = section["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for c in cases {
+        let name = c["name"].as_str().unwrap();
+        let o = &c["options"];
+        let bundle: EvidenceBundle = serde_json::from_value(c["bundle"].clone()).unwrap();
+        let roots: Vec<String> = serde_json::from_value(o["trustedRoots"].clone()).unwrap();
+        let eo = EvidenceVerifyOptions {
+            signature_policy: if o["signaturePolicy"].is_null() { None } else { Some(serde_json::from_value(o["signaturePolicy"].clone()).unwrap()) },
+            require_signatures: false,
+            trusted_roots: Some(&roots),
+            anchors: None,
+            // The anchored-time cases (DEWP §4.7.5) carry a Rekor-witnessed anchor in the bundle's
+            // checkpoint and pin the log key inline: the section stays self-contained.
+            anchor_policy: c
+                .get("policy")
+                .filter(|p| !p.is_null())
+                .map(|p| AnchorPolicy {
+                    required_anchors: p["requiredAnchors"].as_u64().unwrap() as usize,
+                    trusted_issuers: serde_json::from_value(p["trustedIssuers"].clone()).unwrap(),
+                    quorum: if p["quorum"] == "ALL_MUST_AGREE" {
+                        AnchorQuorum::AllMustAgree
+                    } else {
+                        AnchorQuorum::NOfM
+                    },
+                    max_anchor_lag_seconds: p["maxAnchorLagSeconds"].as_i64(),
+                }),
+            resolve_anchor_key: Some(&no_resolver),
+            external_keys: ExternalAnchorKeys {
+                rekor: o["rekorSpki"].as_str().map(str::to_owned),
+                ..Default::default()
+            },
+            trusted_checkpoints: None,
+        };
+        let x = ExecutionOptions {
+            evidence_policy: if o["evidencePolicy"].is_null() { None } else { Some(serde_json::from_value::<ExecutionEvidencePolicy>(o["evidencePolicy"].clone()).unwrap()) },
+            require_execution_confirmed: o["requireExecutionConfirmed"].as_bool().unwrap_or(false),
+            now_ms: Some(crate::execution::dewp_timestamp_ms(&o["now"]).unwrap()),
+            skew_seconds: o["skewSeconds"].as_i64(),
+            max_window_seconds: o["maxWindowSeconds"].as_i64(),
+        };
+        let r = verify_evidence_bundle_with_execution(&bundle, &eo, &x);
+        assert_eq!(r.ok, c["ok"].as_bool().unwrap(), "{name}: {:?}", r.failed);
+        let by_nonce: BTreeMap<String, String> = r.execution.by_nonce.iter().map(|(n, v)| (n.clone(), v.status.clone())).collect();
+        let want: BTreeMap<String, String> = serde_json::from_value(c["execution"]["byNonce"].clone()).unwrap();
+        assert_eq!(by_nonce, want, "{name}: byNonce");
+        let got: Vec<(String, String, bool)> = r.execution.checks.iter().map(|(s, k)| (s.clone(), k.status.clone(), k.trusted)).collect();
+        assert_eq!(got, rows(&c["execution"]["checks"]), "{name}: checks {:?}", r.execution.checks);
+        // Every §4.7.4 finding the case pins: late and untrusted contradictions, dispatch conflicts,
+        // the window cap per nonce and per-source continuity.
+        let f = &c["execution"]["findings"];
+        if let Some(want) = f.get("lateContradicted") {
+            let want: Vec<String> = serde_json::from_value(want.clone()).unwrap();
+            assert_eq!(r.execution.late_contradicted, want, "{name}: late");
+        }
+        if let Some(want) = f.get("untrustedContradicted") {
+            let want: Vec<String> = serde_json::from_value(want.clone()).unwrap();
+            assert_eq!(
+                r.execution.untrusted_contradicted, want,
+                "{name}: untrusted"
+            );
+        }
+        if let Some(want) = f.get("dispatchConflicts") {
+            let want: Vec<String> = serde_json::from_value(want.clone()).unwrap();
+            assert_eq!(r.execution.dispatch_conflicts, want, "{name}: conflicts");
+        }
+        if let Some(want) = f.get("windowCapped") {
+            let want: BTreeMap<String, bool> = serde_json::from_value(want.clone()).unwrap();
+            let got: BTreeMap<String, bool> = r
+                .execution
+                .by_nonce
+                .iter()
+                .map(|(n, v)| (n.clone(), v.window_capped))
+                .collect();
+            assert_eq!(got, want, "{name}: windowCapped");
+        }
+        if let Some(want) = f.get("sources") {
+            let want: BTreeMap<String, SourceContinuity> =
+                serde_json::from_value(want.clone()).unwrap();
+            assert_eq!(r.execution.sources, want, "{name}: sources");
+        }
+        // The per-nonce report and each check agree with the lists they are summarized into.
+        for (nonce, item) in &r.execution.by_nonce {
+            assert_eq!(
+                !item.dispatch_conflict.is_empty(),
+                r.execution.dispatch_conflicts.contains(nonce),
+                "{name}: {nonce} conflict"
+            );
+            assert_eq!(
+                !item.late_contradiction.is_empty(),
+                r.execution.late_contradicted.contains(nonce),
+                "{name}: {nonce} late"
+            );
+            assert_eq!(
+                !item.untrusted_contradiction.is_empty(),
+                r.execution.untrusted_contradicted.contains(nonce),
+                "{name}: {nonce} untrusted"
+            );
+            assert_eq!(
+                item.effective_deadline.is_some(),
+                item.dispatch_seq.is_some(),
+                "{name}: {nonce} deadline"
+            );
+        }
+        for (seq, k) in &r.execution.checks {
+            assert_eq!(
+                k.source.is_some(),
+                k.sequence.is_some(),
+                "{name}: seq {seq} source/sequence"
+            );
+            assert_eq!(
+                k.nonce.is_some(),
+                k.sequence.is_some(),
+                "{name}: seq {seq} nonce/sequence"
+            );
+        }
+        if !c["signatures"].is_null() {
+            let sigs: Vec<(String, String, bool)> = r
+                .signatures
+                .checks
+                .iter()
+                .map(|(s, k)| (s.clone(), k.status.clone(), k.trusted))
+                .collect();
+            assert_eq!(sigs, rows(&c["signatures"]), "{name}: signatures");
+        }
+    }
+    for c in section["proofs"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let o = &c["options"];
+        let bundle: ProofBundle = serde_json::from_value(c["bundle"].clone()).unwrap();
+        let bo: BundleVerifyOptions<_> = BundleVerifyOptions {
+            trusted_root: o["trustedRoot"].as_str().map(str::to_owned),
+            resolve_anchor_key: Some(&no_resolver),
+            ..Default::default()
+        };
+        let policy: Option<ExecutionEvidencePolicy> = if o["evidencePolicy"].is_null() { None } else { Some(serde_json::from_value(o["evidencePolicy"].clone()).unwrap()) };
+        let r = verify_bundle_with_evidence(&bundle, &bo, policy.as_ref());
+        assert!(r.properties.content_verified, "{name}");
+        let got = r.execution.map(|e| (e.status, e.trusted));
+        let want = if c["execution"].is_null() { None } else { Some((c["execution"]["status"].as_str().unwrap().to_string(), c["execution"]["trusted"].as_bool().unwrap())) };
+        assert_eq!(got, want, "{name}");
+    }
+    for c in section["statements"].as_array().unwrap() {
+        let ok = parse_execution_evidence_statement(c["bytes"].as_str().unwrap()).is_ok();
+        assert_eq!(ok, c["ok"].as_bool().unwrap(), "statement {}", c["name"]);
+    }
+    for c in section["builder"].as_array().unwrap() {
+        let i = &c["input"];
+        let bytes = canonical_execution_evidence_statement(&ExecutionEvidenceStatement {
+            nonce: i["nonce"].as_str().unwrap().into(),
+            payload_sha256: i["payloadSha256"].as_str().unwrap().into(),
+            observation: i["observation"].as_object().unwrap().clone(),
+            observed_at: i["observedAt"].as_str().unwrap().into(),
+            sampled_at: i["sampledAt"].as_str().unwrap().into(),
+            sequence: i["sequence"].as_u64().unwrap(),
+            source: i["source"].as_str().unwrap().into(),
+            verdict: i["verdict"].as_str().unwrap().into(),
+        })
+        .unwrap();
+        assert_eq!(bytes, c["bytes"].as_str().unwrap(), "builder {}", c["name"]);
+    }
+}

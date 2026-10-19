@@ -1,3 +1,9 @@
+use crate::execution::{
+    check_execution_evidence_leaf_at, evaluate_execution_evidence_with_options,
+    is_execution_evidence_leaf, verify_evidence_signature_at, AnchoredTimeFn,
+    ExecutionEvaluationOptions, ExecutionEvidenceCheck, ExecutionEvidencePolicy, ExecutionOptions,
+    ExecutionVerification,
+};
 use crate::ledger::{self, AnchorPolicy, ExternalAnchorKeys, ProofBounds, ProofStep, SignedAnchor};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -139,6 +145,9 @@ pub struct CheckResult {
 #[derive(Debug, Clone)]
 pub struct BundleVerification {
     pub signature: AuditSignatureCheck,
+    /// DEWP §4.7.3 for an Evidence Record, None otherwise. One proof cannot bind a statement to its
+    /// dispatch and approval records, so it is at best `unbound`.
+    pub execution: Option<ExecutionEvidenceCheck>,
     pub ok: bool,
     pub daily_root: Option<String>,
     /// "caller-supplied", "self-asserted" or "none". A supplied root is never labelled "independent":
@@ -211,6 +220,20 @@ pub fn verify_audit_signature(
     c: &Value,
     policy: Option<&AuditSignaturePolicy>,
 ) -> AuditSignatureCheck {
+    verify_audit_signature_with_evidence(c, policy, None, None)
+}
+/// [`verify_audit_signature`] with evidence-source trust. An Evidence Record (DEWP §4.7) is checked
+/// against evidence-source trust only, and only once the caller supplies any trust: an approver key
+/// never vouches for a statement and a source key never vouches for an approval (§4.7.5). With no
+/// trust at all, §4.6.1's embedded-key check is unchanged. `anchored_time_ms` is the record's
+/// anchored time (DEWP §4.7.5, Unix ms) for an evidence-source key that carries a validity
+/// interval: None means no counting anchor covers it, and such a key establishes nothing.
+pub fn verify_audit_signature_with_evidence(
+    c: &Value,
+    policy: Option<&AuditSignaturePolicy>,
+    evidence: Option<&ExecutionEvidencePolicy>,
+    anchored_time_ms: Option<i64>,
+) -> AuditSignatureCheck {
     let result = |s, r| signature_result(s, r, false);
     let alg = c["sigAlg"].as_str().unwrap_or("");
     if alg.is_empty()
@@ -229,6 +252,21 @@ pub fn verify_audit_signature(
     let present = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
     if !present(&c["signature"]) || !present(&c["signedPayload"]) {
         return result("not_checked", "Signature or signed payload is missing.");
+    }
+    if (policy.is_some() || evidence.is_some()) && is_execution_evidence_leaf(c) {
+        if alg != "ES256" {
+            return result(
+                "not_checked",
+                "Evidence statements are signed with ES256 only.",
+            );
+        }
+        if evidence.is_none() {
+            return result(
+                "not_checked",
+                "No caller-trusted key for this evidence source.",
+            );
+        }
+        return verify_evidence_signature_at(c, evidence, anchored_time_ms);
     }
     if policy.is_none() && alg == "ES256" {
         if !present(&c["signerPublicKey"]) {
@@ -366,6 +404,15 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
     b: &ProofBundle,
     o: &BundleVerifyOptions<F>,
 ) -> BundleVerification {
+    verify_bundle_with_evidence(b, o, None)
+}
+
+/// [`verify_bundle`] with evidence-source trust for an Evidence Record (DEWP §4.7.3).
+pub fn verify_bundle_with_evidence<F: Fn(&SignedAnchor) -> Option<String>>(
+    b: &ProofBundle,
+    o: &BundleVerifyOptions<F>,
+    evidence: Option<&ExecutionEvidencePolicy>,
+) -> BundleVerification {
     let mut notes = Vec::new();
     let kind_ok = b.kind == BUNDLE_KIND
         && supported_envelope(
@@ -456,19 +503,10 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
     );
     let commitment = inc == Some(true) && consistency == Some(true);
     let content = commitment && leaf == Some(true) && header != Some(false);
-    let signature_check = if content {
-        verify_audit_signature(
-            b.event.canonical.as_ref().unwrap(),
-            o.signature_policy.as_ref(),
-        )
-    } else {
-        unchecked_signature()
-    };
-    let signature = signature_check.status == "verified";
-    let has_signer = signature_check.status != "not_applicable";
     let mut anchor_verified = false;
     let mut divergence = false;
     let mut witness_times = std::collections::BTreeMap::new();
+    let mut anchored_time_ms: Option<i64> = None;
     if let (Some(policy), Some(r)) = (&o.anchor_policy, root.as_deref()) {
         let candidates = o.anchors.clone().unwrap_or_else(|| {
             let mut a = b.anchors.clone();
@@ -501,6 +539,16 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
         anchor_verified = commitment && q.ok;
         divergence = q.divergence;
         witness_times = q.witness_times.clone();
+        // DEWP §4.7.5: the earliest external witness time among the issuers that COUNTED (a SELF
+        // anchor has none) places a bounded evidence-source key in time; a divergent proof has none.
+        if anchor_verified && !divergence {
+            anchored_time_ms = q
+                .verified_issuers
+                .iter()
+                .filter_map(|i| q.witness_times.get(i))
+                .min()
+                .map(|t| t.saturating_mul(1000));
+        }
         if let Some(n) = q.reason {
             notes.push(n)
         }
@@ -508,6 +556,27 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
             notes.push(n)
         }
     }
+    // DEWP §4.7: the signature and statement checks run once the anchored time is known (§4.7.5) —
+    // a caller key with a validity interval is placed in time by the counted anchors' external
+    // witness, never by the statement's own timestamps. With no counting anchor (or on divergence)
+    // it has no anchored time, and the two reports agree on a bounded key.
+    let signature_check = match b.event.canonical.as_ref() {
+        Some(c) if content => verify_audit_signature_with_evidence(
+            c,
+            o.signature_policy.as_ref(),
+            evidence,
+            anchored_time_ms,
+        ),
+        _ => unchecked_signature(),
+    };
+    let signature = signature_check.status == "verified";
+    let has_signer = signature_check.status != "not_applicable";
+    let execution = match b.event.canonical.as_ref() {
+        Some(c) if content && is_execution_evidence_leaf(c) => Some(
+            check_execution_evidence_leaf_at(c, evidence, anchored_time_ms),
+        ),
+        _ => None,
+    };
     let props = VerificationProperties {
         commitment_verified: commitment,
         content_verified: content,
@@ -532,6 +601,7 @@ pub fn verify_bundle<F: Fn(&SignedAnchor) -> Option<String>>(
         && (!o.require_signatures || (signature && signature_check.trusted));
     BundleVerification {
         signature: signature_check,
+        execution,
         ok,
         daily_root: root,
         root_source: source,
@@ -643,6 +713,9 @@ pub struct EvidenceVerification {
     pub notes: Vec<String>,
     pub roots: Vec<EvidenceRoot>,
     pub signatures: EvidenceSignatures,
+    /// DEWP §4.7 over the content-verified entries: what caller-trusted sources observed, never
+    /// physical truth, and it never changes the properties above.
+    pub execution: ExecutionVerification,
 }
 pub struct EvidenceVerifyOptions<'a, F: Fn(&SignedAnchor) -> Option<String>> {
     pub signature_policy: Option<AuditSignaturePolicy>,
@@ -693,7 +766,179 @@ pub fn verify_evidence_bundle(
     b: &EvidenceBundle,
     trusted_roots: Option<&[String]>,
 ) -> EvidenceVerification {
-    verify_evidence_entries(b, trusted_roots, None, None, false)
+    let x = ExecutionOptions::default();
+    let (mut r, content) = verify_evidence_entries(b, trusted_roots, None);
+    // No anchor policy here, so no root is anchor-verified and no record has an anchored time.
+    finish_signatures(&mut r, b, &content.entries, None, false, None, None);
+    finish_execution(&mut r, &content.entries, &x, None);
+    r.ok &= r.failed.is_empty();
+    r
+}
+
+/// Leaf-bound entries, the only ones §4.7 may read, each with the root ITS OWN inclusion proof
+/// names — handed back for the caller to check signatures and evaluate §4.7 once the roots' anchor
+/// verdicts (and so each record's anchored time, DEWP §4.7.5) are known.
+#[derive(Default)]
+struct ContentEntries {
+    entries: Vec<(String, Value)>,
+    root_by_seq: std::collections::BTreeMap<String, String>,
+}
+
+/// §7.1 signatureVerified per content-verified entry, with each record's anchored time known
+/// (DEWP §4.7.5), so the §4.6.1 report and the §4.7.3 statement check agree on a bounded
+/// evidence-source key; then the caller's trusted-signature requirement over every entry.
+fn finish_signatures(
+    r: &mut EvidenceVerification,
+    b: &EvidenceBundle,
+    content_entries: &[(String, Value)],
+    signature_policy: Option<&AuditSignaturePolicy>,
+    require_signatures: bool,
+    evidence_policy: Option<&ExecutionEvidencePolicy>,
+    anchored_time: Option<AnchoredTimeFn<'_>>,
+) {
+    let mut by_seq = std::collections::BTreeMap::<&str, AuditSignatureCheck>::new();
+    for (seq, c) in content_entries {
+        let check = verify_audit_signature_with_evidence(
+            c,
+            signature_policy,
+            evidence_policy,
+            anchored_time.and_then(|f| f(seq)),
+        );
+        if check.status == "verified" {
+            r.signatures.verified += 1;
+        } else if check.status == "invalid" {
+            r.signatures.invalid.push(seq.clone());
+        } else {
+            r.signatures.not_checkable += 1;
+        }
+        by_seq.insert(seq.as_str(), check);
+    }
+    r.signatures.checks = b
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.event.seq.clone(),
+                by_seq
+                    .get(e.event.seq.as_str())
+                    .cloned()
+                    .unwrap_or_else(unchecked_signature),
+            )
+        })
+        .collect();
+    if require_signatures {
+        for (seq, check) in &r.signatures.checks {
+            if check.status != "verified" || !check.trusted {
+                r.failed.push((
+                    seq.clone(),
+                    format!("Required trusted signature: {}", check.reason),
+                ));
+            }
+        }
+    }
+}
+
+/// DEWP §4.7 over the content-verified entries, once the roots' anchor verdicts (and so each
+/// record's anchored time, §4.7.5) are known, plus the caller's confirmed-execution policy.
+fn finish_execution(
+    r: &mut EvidenceVerification,
+    content_entries: &[(String, Value)],
+    x: &ExecutionOptions,
+    anchored_time: Option<AnchoredTimeFn<'_>>,
+) {
+    r.execution = evaluate_execution_evidence_with_options(
+        content_entries,
+        &ExecutionEvaluationOptions {
+            policy: x.evidence_policy.as_ref(),
+            now_ms: x.now_ms,
+            skew_seconds: x.skew_seconds,
+            max_window_seconds: x.max_window_seconds,
+            anchored_time,
+        },
+    );
+    if !x.require_execution_confirmed {
+        return;
+    }
+    if r.execution.by_nonce.is_empty() {
+        r.failed.push((
+            "-".into(),
+            "Required confirmed execution: the bundle records no execution".into(),
+        ));
+    }
+    for (nonce, item) in &r.execution.by_nonce {
+        if item.status != "confirmed" {
+            let seq = item
+                .dispatch_seq
+                .clone()
+                .or_else(|| item.evidence_seqs.first().cloned())
+                .unwrap_or_else(|| "-".into());
+            r.failed.push((
+                seq,
+                format!(
+                    "Required confirmed execution: nonce {nonce} is {}",
+                    item.status
+                ),
+            ));
+        }
+        // §4.7.4: a dispatch conflict means the executing party wrote two accounts of what it sent.
+        if let Some(first) = item.dispatch_conflict.first() {
+            r.failed.push((
+                first.clone(),
+                format!(
+                    "Required confirmed execution: nonce {nonce} has conflicting Dispatch Records (seq {})",
+                    item.dispatch_conflict.join(", ")
+                ),
+            ));
+        }
+        // §4.7.4: a registered source signed a contradiction the status could not count — after the
+        // window the executing party chose, or under a key the bundle cannot place in time. Neither
+        // may clear a policy that requires confirmation.
+        if let Some(first) = item.late_contradiction.first() {
+            r.failed.push((
+                first.clone(),
+                format!(
+                    "Required confirmed execution: nonce {nonce} has a late contradiction (seq {})",
+                    item.late_contradiction.join(", ")
+                ),
+            ));
+        }
+        if let Some(first) = item.untrusted_contradiction.first() {
+            r.failed.push((
+                first.clone(),
+                format!(
+                    "Required confirmed execution: nonce {nonce} has a contradiction under a provisioned key that established no trust (seq {})",
+                    item.untrusted_contradiction.join(", ")
+                ),
+            ));
+        }
+    }
+    // §4.7.3 source continuity: a gap or a divergence means the bundle does not carry the whole account.
+    for (source, c) in &r.execution.sources {
+        if !c.gaps.is_empty() {
+            let ranges = c
+                .gaps
+                .iter()
+                .map(|(a, b)| {
+                    if a == b {
+                        a.to_string()
+                    } else {
+                        format!("{a}–{b}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            r.failed.push(("-".into(), format!("Required confirmed execution: source {source} is missing statement(s) {ranges}")));
+        }
+        if !c.divergent.is_empty() {
+            let seqs = c
+                .divergent
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            r.failed.push(("-".into(), format!("Required confirmed execution: source {source} signed two statements under sequence {seqs}")));
+        }
+    }
 }
 
 /// The position and time anchors over a checkpoint are held to — the caller's record where it states
@@ -721,9 +966,8 @@ fn verify_evidence_entries(
     b: &EvidenceBundle,
     trusted_roots: Option<&[String]>,
     trusted_checkpoints: Option<&[ledger::TrustedCheckpoint]>,
-    signature_policy: Option<&AuditSignaturePolicy>,
-    require_signatures: bool,
-) -> EvidenceVerification {
+) -> (EvidenceVerification, ContentEntries) {
+    let mut content = ContentEntries::default();
     let mut r = EvidenceVerification {
         total: b.entries.len(),
         ..Default::default()
@@ -796,6 +1040,41 @@ fn verify_evidence_entries(
         ] {
             if bad {
                 r.failed.push(("-".into(), format!("checkpoint {id} {field} contradicts your trusted checkpoint record for its root")));
+            }
+        }
+    }
+    // One root, one checkpoint. A second entry for a root the bundle already lists — with a wider seq
+    // range, or without the chain fields the first one is held to — would otherwise ride on the first
+    // one's anchor verdict: anchors are checked against the FIRST checkpoint for a root, but a
+    // record's anchored time (DEWP §4.7.5) would be looked up through whichever copy claimed to cover
+    // it. An identical duplicate is tolerated.
+    {
+        let shape = |c: &EvidenceCheckpoint| {
+            (
+                c.id.clone(),
+                c.seq_start.clone(),
+                c.seq_end.clone(),
+                c.entry_count,
+                c.anchored_at.clone(),
+                c.chain_hash.clone(),
+                c.prev_chain_hash.clone(),
+            )
+        };
+        let mut seen = std::collections::BTreeMap::<&str, _>::new();
+        for c in &b.checkpoints {
+            let s = shape(c);
+            match seen.get(c.root.as_str()) {
+                None => {
+                    seen.insert(c.root.as_str(), s);
+                }
+                Some(prior) if *prior != s => r.failed.push((
+                    "-".into(),
+                    format!(
+                        "checkpoint {} lists a root the bundle already states with different fields",
+                        c.id.as_deref().unwrap_or("?")
+                    ),
+                )),
+                Some(_) => {}
             }
         }
     }
@@ -926,15 +1205,14 @@ fn verify_evidence_entries(
                     }
                 }
                 r.content_verified += 1;
-                let check = verify_audit_signature(c, signature_policy);
-                if check.status == "verified" {
-                    r.signatures.verified += 1;
-                } else if check.status == "invalid" {
-                    r.signatures.invalid.push(e.event.seq.clone());
-                } else {
-                    r.signatures.not_checkable += 1;
-                }
-                r.signatures.checks.push((e.event.seq.clone(), check));
+                // §7.1 signatureVerified is checked by `finish_signatures`, once the anchor quorum
+                // has run: the leaf binding above passed, so the signature is provably the committed
+                // one, and an evidence-source key with a validity interval needs the record's
+                // anchored time (DEWP §4.7.5) to be placed in time.
+                content.entries.push((e.event.seq.clone(), c.clone()));
+                content
+                    .root_by_seq
+                    .insert(e.event.seq.clone(), root.to_owned());
             }
         } else if match e.event.redaction.as_ref() {
             Some(redaction) => redaction.mode == "COMMITMENT_ONLY",
@@ -1066,43 +1344,25 @@ fn verify_evidence_entries(
             _ => r.notes.push("Bundle declares a tenantSequenceCommitment but no entry carries a tenantSeq to check it against.".into()),
         }
     }
-    let by_seq: std::collections::BTreeMap<_, _> = r.signatures.checks.iter().cloned().collect();
-    r.signatures.checks = b
-        .entries
-        .iter()
-        .map(|e| {
-            (
-                e.event.seq.clone(),
-                by_seq
-                    .get(&e.event.seq)
-                    .cloned()
-                    .unwrap_or_else(unchecked_signature),
-            )
-        })
-        .collect();
-    if require_signatures {
-        for (seq, check) in &r.signatures.checks {
-            if check.status != "verified" || !check.trusted {
-                r.failed.push((
-                    seq.clone(),
-                    format!("Required trusted signature: {}", check.reason),
-                ));
-            }
+    // One result per root (the reference's `knownRoots`): a tolerated identical duplicate must not
+    // add a second, never-evaluated entry that reads as "not anchored". The display `anchor_ref` is
+    // the last one stated.
+    let mut roots_out: Vec<EvidenceRoot> = Vec::new();
+    for c in &b.checkpoints {
+        match roots_out.iter_mut().find(|x| x.root == c.root) {
+            Some(x) => x.anchor_ref = c.anchor_ref.clone(),
+            None => roots_out.push(EvidenceRoot {
+                root: c.root.clone(),
+                anchor_ref: c.anchor_ref.clone(),
+                anchor_verified: None,
+                verified_issuers: Vec::new(),
+                witness_times: std::collections::BTreeMap::new(),
+            }),
         }
     }
-    r.roots = b
-        .checkpoints
-        .iter()
-        .map(|c| EvidenceRoot {
-            root: c.root.clone(),
-            anchor_ref: c.anchor_ref.clone(),
-            anchor_verified: None,
-            verified_issuers: Vec::new(),
-            witness_times: std::collections::BTreeMap::new(),
-        })
-        .collect();
+    r.roots = roots_out;
     r.ok = r.failed.is_empty() && !b.entries.is_empty() && trusted.is_some();
-    r
+    (r, content)
 }
 
 #[cfg(test)]
@@ -1317,6 +1577,66 @@ mod parity_tests {
         run_bundle_cases(&ih["bundles"]["cases"], &ih["keys"], None);
     }
 
+    /// DEWP §4.7.5: one root, one checkpoint. A second listing with differing fields is refused; an
+    /// identical one is tolerated and still yields one root result.
+    #[test]
+    fn a_root_listed_twice_with_different_fields_is_refused() {
+        let parity: Value = serde_json::from_str(include_str!(
+            "../vectors/verifier-parity-vectors.json"
+        ))
+        .unwrap();
+        let case = parity["executionEvidence"]["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "confirmed")
+            .unwrap();
+        let bundle: EvidenceBundle = serde_json::from_value(case["bundle"].clone()).unwrap();
+        let roots: Vec<String> =
+            serde_json::from_value(case["options"]["trustedRoots"].clone()).unwrap();
+        assert_eq!(bundle.checkpoints.len(), 1);
+        let first = bundle.checkpoints[0].clone();
+        assert!(verify_evidence_bundle(&bundle, Some(&roots)).ok);
+
+        // A copy claiming a wider range, without the chain fields the first one is held to.
+        let mut wider = bundle.clone();
+        wider.checkpoints.push(EvidenceCheckpoint {
+            id: Some("cp-x-copy".into()),
+            seq_end: Some("999999999".into()),
+            entry_count: None,
+            prev_chain_hash: None,
+            chain_hash: None,
+            anchors: Vec::new(),
+            ..first.clone()
+        });
+        let got = verify_evidence_bundle(&wider, Some(&roots));
+        assert!(!got.ok);
+        assert!(
+            got.failed.iter().any(|(seq, reason)| seq == "-" && reason == "checkpoint cp-x-copy lists a root the bundle already states with different fields"),
+            "{:?}",
+            got.failed
+        );
+        // One field is enough.
+        let mut redated = bundle.clone();
+        redated.checkpoints.push(EvidenceCheckpoint {
+            anchored_at: Some("2026-10-06T23:59:00.000Z".into()),
+            ..first.clone()
+        });
+        assert!(!verify_evidence_bundle(&redated, Some(&roots)).ok);
+
+        // An identical duplicate (anchors and anchorRef aside) is tolerated, and the root is reported once.
+        let mut same = bundle.clone();
+        same.checkpoints.push(EvidenceCheckpoint {
+            anchor_ref: Some("self://copy".into()),
+            ..first
+        });
+        let got = verify_evidence_bundle(&same, Some(&roots));
+        assert!(got.ok, "{:?}", got.failed);
+        assert_eq!(got.roots.len(), 1);
+        assert_eq!(got.roots[0].anchor_ref.as_deref(), Some("self://copy"));
+        assert_eq!(got.execution.by_nonce.len(), 1);
+    }
+
     #[test]
     fn external_rfc3161_trust_does_not_require_self_key_resolver() {
         let parity: Value = serde_json::from_str(include_str!(
@@ -1402,24 +1722,35 @@ pub fn verify_evidence_bundle_with_options<F: Fn(&SignedAnchor) -> Option<String
     b: &EvidenceBundle,
     o: &EvidenceVerifyOptions<F>,
 ) -> EvidenceVerification {
-    let mut r = verify_evidence_entries(
-        b,
-        o.trusted_roots,
-        o.trusted_checkpoints,
-        o.signature_policy.as_ref(),
-        o.require_signatures,
-    );
+    verify_evidence_bundle_with_execution(b, o, &ExecutionOptions::default())
+}
+
+/// [`verify_evidence_bundle_with_options`] plus DEWP §4.7 execution evidence under `x`.
+pub fn verify_evidence_bundle_with_execution<F: Fn(&SignedAnchor) -> Option<String>>(
+    b: &EvidenceBundle,
+    o: &EvidenceVerifyOptions<F>,
+    x: &ExecutionOptions,
+) -> EvidenceVerification {
+    let (mut r, content) = verify_evidence_entries(b, o.trusted_roots, o.trusted_checkpoints);
     let mut by_root = std::collections::BTreeMap::<String, Vec<SignedAnchor>>::new();
     let mut expected_by_root =
         std::collections::BTreeMap::<String, ledger::ExpectedCheckpoint>::new();
     let mut checkpoint_key_to_root = std::collections::BTreeMap::<String, String>::new();
     for cp in &b.checkpoints {
-        by_root.insert(cp.root.clone(), cp.anchors.clone());
+        // One root, one checkpoint: the FIRST one stated holds the position its anchors (and every
+        // record's anchored time, DEWP §4.7.5) are held to, as in the reference; the quorum
+        // candidates are the last non-empty anchor list stated for the root.
+        let anchors = by_root.entry(cp.root.clone()).or_default();
+        if !cp.anchors.is_empty() {
+            *anchors = cp.anchors.clone();
+        }
         // Anchors are held to the caller's record where it states a field (DEWP §5.3).
         let record = o
             .trusted_checkpoints
             .and_then(|x| x.iter().find(|t| t.root == cp.root));
-        expected_by_root.insert(cp.root.clone(), effective_checkpoint(Some(cp), record).0);
+        expected_by_root
+            .entry(cp.root.clone())
+            .or_insert_with(|| effective_checkpoint(Some(cp), record).0);
         if let Some(id) = &cp.id {
             checkpoint_key_to_root.insert(id.clone(), cp.root.clone());
         }
@@ -1520,6 +1851,57 @@ pub fn verify_evidence_bundle_with_options<F: Fn(&SignedAnchor) -> Option<String
     if !caller_keyed && !caller_anchors.is_empty() && known_roots.len() > 1 {
         r.notes.push("Caller anchors were supplied as one flat list for a multi-checkpoint bundle; use EvidenceAnchorSet::ByCheckpoint for per-checkpoint divergence attribution.".into());
     }
+    // DEWP §4.7.5: a record's anchored time is the earliest external witness time among the anchors
+    // that COUNTED toward quorum for the checkpoint ITS OWN inclusion proof names, and only when its
+    // seq lies within the range those anchors were held to. Only issuers in `verified_issuers`
+    // counted; a SELF/ES256 anchor has no witness time and contributes nothing. Never another
+    // checkpoint's time: a listed checkpoint claiming a wider range would otherwise backdate every
+    // record under it. Used solely to place a caller key's validity interval in time — never a
+    // self-claimed `observedAt`/`sampledAt`.
+    let mut anchored_root_ms = std::collections::BTreeMap::<String, i64>::new();
+    for root in &r.roots {
+        if root.anchor_verified != Some(true) {
+            continue;
+        }
+        let earliest = root
+            .verified_issuers
+            .iter()
+            .filter_map(|i| root.witness_times.get(i))
+            .min();
+        if let Some(t) = earliest {
+            anchored_root_ms
+                .entry(root.root.clone())
+                .or_insert(t.saturating_mul(1000));
+        }
+    }
+    let seq_num = |v: &str| -> Option<u128> {
+        (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse().ok())
+            .flatten()
+    };
+    let anchored_time = |seq: &str| -> Option<i64> {
+        let root = content.root_by_seq.get(seq)?;
+        let t = *anchored_root_ms.get(root)?;
+        // The range the anchors were held to: the caller's record where it states one, else the
+        // bundle's first checkpoint for the root.
+        let expected = expected_by_root.get(root)?;
+        let s = seq_num(seq)?;
+        let lo = expected.seq_start.as_deref().and_then(seq_num)?;
+        let hi = expected.seq_end.as_deref().and_then(seq_num)?;
+        (lo <= s && s <= hi).then_some(t)
+    };
+    // §7.1 signatureVerified per content-verified entry, with the anchored time now known, so the
+    // §4.6.1 report and the §4.7.3 statement check agree on a bounded evidence-source key.
+    finish_signatures(
+        &mut r,
+        b,
+        &content.entries,
+        o.signature_policy.as_ref(),
+        o.require_signatures,
+        x.evidence_policy.as_ref(),
+        Some(&anchored_time),
+    );
+    finish_execution(&mut r, &content.entries, x, Some(&anchored_time));
     let trusted = o.trusted_roots.is_some() || o.trusted_checkpoints.is_some();
     r.ok = r.failed.is_empty()
         && !b.entries.is_empty()

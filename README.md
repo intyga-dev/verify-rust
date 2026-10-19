@@ -126,6 +126,55 @@ revocation. Verification does not consume a nonce or prove execution.
 The short DIV display-code derivation and document-signing canonical builder remain outside this
 port's API; neither is used to authenticate a receipt. Portable-number limits are unchanged.
 
+### Execution evidence (DEWP §4.7)
+
+`bundle::verify_evidence_bundle_with_execution(bundle, options, &ExecutionOptions { .. })` reports,
+beside the §7.1 properties, what caller-trusted evidence sources observed about each approved
+action — never physical truth, and never a change to commitment, content, signature or anchor
+verification. `ExecutionOptions`:
+
+- `evidence_policy` — evidence-source trust, separate from approver trust (`AuditSignaturePolicy`):
+  source identifier → keys. A key is a bare base64 SPKI P-256 string, or
+  `TrustedSourceKey::Bounded { key, not_before, not_after }` (inclusive DEWP §4.3 timestamps). A
+  bounded key verifies a statement but establishes trust only when the record's **anchored time** —
+  the earliest Rekor/TSA witness time among the anchors that counted toward quorum for the
+  checkpoint the record's OWN inclusion proof names, and only if its seq lies within the range those
+  anchors were held to — lies inside the interval; with no counting anchor the check is `verified`
+  and `trusted: false`, with the reason. The time is never taken from another checkpoint, and a
+  bundle that lists one root twice with differing fields is refused. An approver key never verifies
+  a statement and a source key never verifies an approval. The policy deserializes from the JSON
+  form (`{"trustedSources": {"did:…": ["<spki>", {"key": "<spki>", "notAfter": "…"}]}}`): an object
+  entry has exactly the members `key`, `notBefore` and `notAfter` (the last two optional). One with
+  any other member (a misspelt `notafter`), or with a bound that is present but not a string, is
+  `TrustedSourceKey::Malformed` — kept with its key, it verifies but never trusts, and the check says
+  why; an entry with no usable string key is `TrustedSourceKey::Unusable` and is dropped.
+- `now_ms` — the §4.7.4 evaluation time (default: now), an input so a status is reproducible.
+- `skew_seconds` (default 30) — how long before the Dispatch Record's `createdAt` a statement's
+  `sampledAt` may lie; clock error only. A negative value falls back to the default.
+- `max_window_seconds` (default 86 400) — the evidence window is the earlier of the Dispatch Record's
+  `evidenceDeadline` and `createdAt` plus this bound; a far-out deadline never keeps a nonce `pending`.
+  A negative value falls back to the default.
+- `require_execution_confirmed` — fail unless the bundle reports at least one nonce and every one is
+  `confirmed`, with no dispatch conflict, late contradiction, untrusted contradiction, source gap or
+  divergence.
+
+The result's `execution` carries one check per Evidence Record (`status`, `reason`, `trusted`,
+`nonce`, `verdict`, `source`, `sequence`), a per-nonce report (`status`, the governing
+`dispatch_seq`, `evidence_deadline`, `effective_deadline`, `window_capped`, `dispatch_conflict`,
+`late_contradiction`, `untrusted_contradiction`, `evidence_seqs`) for every nonce an Approval,
+Dispatch or Evidence Record names, the status lists, `late_contradicted`, `untrusted_contradicted`
+(a bound, in-window or late `contradicted` whose signature verified under a provisioned key that established
+no trust — never silent, never counted; not reported for the embedded key) and
+`dispatch_conflicts`, and `sources`: per-source continuity over the statements whose signature
+verified (`first`, `last`, `gaps` as inclusive ranges, `divergent` counter values). A statement
+binds to any Dispatch Record carrying its payload hash; the window is evaluated on `sampledAt`. The
+§4.6.1 report in `signatures.checks` uses the same anchored time, so it agrees with
+`execution.checks` on a bounded key. `bundle::verify_bundle_with_evidence` runs steps 1–4 for a
+single proof (never `verified`; at best `unbound`), using the proof's own anchor-verified root for
+the anchored time — for both its signature and its statement check. `execution::parse_execution_evidence_statement`
+and `canonical_execution_evidence_statement` are the statement parser and builder, pinned by the
+shared `executionEvidence` vectors in all five languages.
+
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
 - Python — [`verify-python`](https://github.com/intyga-dev/verify-python)

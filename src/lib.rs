@@ -14,6 +14,7 @@ use unicode_normalization::UnicodeNormalization;
 
 pub mod bundle;
 pub mod chain;
+pub mod execution;
 pub mod ledger;
 pub mod rekor;
 pub mod rfc3161;
@@ -1354,7 +1355,7 @@ fn check_tenant_binding(value: &Value, expected: Option<&str>) -> Result<Option<
 /// its caller treated None as "skip the window check" — both fixed. It then accepted lowercase
 /// separators, a comma fraction, any number of fraction digits, `:60` and day 31 of any month,
 /// where the TS/Go/Java/Python ports disagreed with each other; all five now apply this grammar.
-fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let digits = |from: usize, to: usize| -> Option<i64> {
         let part = b.get(from..to)?;
@@ -1566,6 +1567,11 @@ fn verify_approval_receipt_inner(
     // would be exactly the pre-signed bearer capability the design exists to avoid.
     if payload_type == DIV_DELEGATION_TYPE {
         return Err("this is a delegation, which authorizes no action on its own — verify it with verify_delegation and pass the result as opts.delegation, together with an offline approval signed by the delegated operators".to_string());
+    }
+    // A DEWP execution-evidence statement (DEWP §4.7) is a source's observation AFTER execution, not
+    // an approval. Refused with its own reason, like the other non-approval kinds.
+    if payload_type == execution::DEWP_EXECUTION_EVIDENCE_TYPE {
+        return Err("this is a DEWP execution-evidence statement, which approves nothing — evaluate it with execution::evaluate_execution_evidence over an evidence bundle".to_string());
     }
     let offline = payload_type == DIV_OFFLINE_INTENT_TYPE;
     if !offline && payload_type != DIV_INTENT_TYPE {
@@ -3193,6 +3199,11 @@ mod tests {
                 expect_ok,
                 result
             );
+            // A DEWP §4.7 statement must be refused for being one, not for a later step.
+            if name == "execution-evidence-refused-by-approval-verifier" {
+                let err = result.clone().expect_err("must be refused");
+                assert!(err.contains("execution-evidence statement"), "{name}: {err}");
+            }
             // Pinning the REASON, not just the refusal: `0 >= 0` makes DIV §5 step 7 true with
             // nothing counted, so this receipt can be refused for the right rule or for none.
             if name == "zero-required-approvals-refused" {

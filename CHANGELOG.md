@@ -5,6 +5,56 @@ All notable changes to `intyga-verify` (Rust) are documented here. The format fo
 
 ## [Unreleased]
 
+## [2.1.0]
+
+- **DEWP 1.1 §4.7 execution evidence** (`execution` module). New source-compatible entry points:
+  `verify_evidence_bundle_with_execution` (`ExecutionOptions`), `verify_bundle_with_evidence` and
+  `verify_audit_signature_with_evidence`; the existing functions delegate with no evidence trust.
+  `EvidenceVerification.execution` and `BundleVerification.execution` are new result fields. The
+  approval verifier refuses the statement type.
+- **DEWP 1.1 pre-publication review (October 2026)**, all within §4.7 and pinned by the regenerated
+  `executionEvidence` parity vectors: the statement has nine members — `sampledAt` (when the
+  measurement was taken; the window is evaluated on it, and it may not be later than `observedAt`)
+  and `sequence` (the source's per-log gapless counter, an integer 1..2^53 − 1; `418.0`, `418.5`,
+  `"418"`, 0 and negatives are malformed) join the seven — so `ExecutionEvidenceStatement` gains
+  `sampled_at` and `sequence`. Binding takes any Dispatch Record carrying the statement's payload
+  hash (the lowest-seq match governs), so an early record with another hash can no longer unbind a
+  trusted contradiction; Dispatch Records for one nonce that disagree are reported as
+  `dispatch_conflict` / `dispatch_conflicts`. The evidence window is cut to the caller's
+  `ExecutionOptions::max_window_seconds` (default 86 400; `effective_deadline`, `window_capped`), the
+  default `skew_seconds` is 30 (was 300), and `unconfirmed` uses the effective deadline. Every
+  Approval Record's nonce is reported (`not_reported` when never dispatched). A trusted, bound
+  `contradicted` sampled after the deadline is a `late_contradiction` / `late_contradicted` finding.
+  Per-source continuity is reported in `sources` (`first`, `last`, `gaps`, `divergent`), and
+  `require_execution_confirmed` also fails on a dispatch conflict, gap or divergence. Evidence-source
+  keys may carry a validity interval (`TrustedSourceKey::Bounded`; `ExecutionEvidencePolicy::trusted_sources`
+  now holds `Vec<TrustedSourceKey>`), checked at the record's anchored time — the earliest counting
+  Rekor/TSA witness over a checkpoint covering it — via the new `verify_evidence_signature_at`,
+  `check_execution_evidence_leaf_at` and `evaluate_execution_evidence_with_options`
+  (`ExecutionEvaluationOptions`); the unsuffixed functions keep their signatures and pass no anchored
+  time. Each check carries `source` and `sequence`.
+- **Second review pass (fail-closed corrections, pinned by the regenerated vectors):** a record's
+  anchored time comes only from the checkpoint ITS OWN inclusion proof names, and only when its seq
+  lies within the range those anchors were held to (the caller's record where it states one, else
+  the bundle's first checkpoint for the root) — never from another checkpoint that claims to cover
+  it; a bundle listing one root twice with differing `id`/`seqStart`/`seqEnd`/`entryCount`/
+  `anchoredAt`/`chainHash`/`prevChainHash` is refused (an identical duplicate is tolerated, and
+  `roots` reports each root once). A key entry is a bare string or an object with exactly `key`,
+  `notBefore` and `notAfter`: an object entry with any other member, or with a bound that is present
+  but not a string, is kept as `TrustedSourceKey::Malformed { key, reason, entry }` — it verifies a
+  signature (`verified`, `trusted: false`, the reason naming the member or bound) but never
+  establishes trust; an entry with no usable string key is `TrustedSourceKey::Unusable` and is
+  dropped. A bound, in-window or late `contradicted` under a provisioned key that established no trust is
+  reported as `untrusted_contradiction` / `untrusted_contradicted` (never under the embedded key),
+  and `require_execution_confirmed` also fails on a late or an untrusted contradiction.
+  `verify_audit_signature_with_evidence` takes the record's anchored time as a fourth argument, and
+  both the evidence-bundle and the single-proof verifier run the §4.6.1 signature check after the
+  anchor quorum, so `signatures.checks` and `execution.checks` agree on a bounded key. A negative
+  `skew_seconds` or `max_window_seconds` falls back to the default rather than removing the bound.
+- Keep bound, late contradictions signed by caller-provisioned keys as untrusted-contradiction
+  findings when key trust is not established. Requiring confirmed execution rejects them even
+  alongside a trusted confirmation; execution status and trust are unchanged.
+
 ## [2.0.0]
 
 - Bind delegation verification to the independently expected requester; a workload cannot reuse
