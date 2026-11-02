@@ -3,7 +3,101 @@
 All notable changes to `intyga-verify` (Rust) are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.3.0]
+
+- DIV §4.3.2 "Enrolled approver devices" (targets DIV 1.3.0). `ApprovalRequirement` gains
+  `require_enrolled_device: Option<bool>`: `None` when absent, `Some(true)` when required; a present
+  `false`, `null` or non-boolean binds as `Some(false)` and is refused as malformed
+  ("requirement.requireEnrolledDevice must be omitted or true (DIV §4.3.2)"). The canonical builders
+  emit the member only for `Some(true)`, as the literal `true` (historical payloads keep their bytes);
+  the offline-intent, delegation and agent-authority builders refuse it ("requireEnrolledDevice is
+  defined only for ordinary approval intents (DIV §4.3.2)"), and so does any builder together with
+  `require_hardware_key` or a non-empty `allowed_aaguids` ("requireEnrolledDevice cannot be combined
+  with requireHardwareKey or allowedAaguids (DIV §4.3.2)").
+- `verify_approval_receipt*` checks the signed field after the signer class and before the step-3d
+  floor (malformed, offline-intent and hardware-combination refusals), and `verify_delegation` /
+  `verify_agent_authority` refuse any present value at the same position. **Breaking for struct
+  literals:** `Expected` gains `enrolled_device_keys: Option<Vec<String>>` (your enrollment records,
+  base64 SPKI or COSE). Under a signed `requireEnrolledDevice` it is required ("the signed policy
+  requires an enrolled approver device; supply expected.enrolled_device_keys from your own enrollment
+  records (DIV §4.3.2)"; an empty entry is "expected.enrolled_device_keys must be an array of base64
+  public keys"), checked after the anchor-shape refusals, and a witness then counts only if it is not
+  WEBAUTHN and the trusted key it verified under is in the list (compared by key fingerprint, so SPKI
+  and COSE of one key match). Ignored when the field is not signed.
+- `RequirementFloor` gains `require_enrolled_device: bool` (serde default `false`): a floor demanding
+  it refuses a signed requirement without it ("... it does not require an enrolled approver device
+  (DIV §5 step 3d)"). Existing `RequirementFloor { .. }` literals without `..Default::default()` need
+  the field.
+- New public reason constants `ENROLLED_DEVICE_*_REASON`. Pinned by the `enrolledDevice` section of
+  `verifier-parity-vectors.json` and the last `intentPayloads` entry of `canonical-vectors.json`.
+
+## [2.2.0]
+
+- An explicit `null` `requester.credentialIssuerDid` in a receipt, or `null` signed
+  `requirement.excludedSignerDids`, is refused as malformed with the reference's reasons instead of
+  being read as `None` (DIV §4.3.2): it now deserializes to `Some("")` / `Some([""])`. No field
+  changes type. Every public canonical builder now refuses a malformed issuer DID
+  ("credentialIssuerDid must be a valid DID") or exclusion entry ("excludedSignerDids must be a DID
+  array"), as the other ports do. Pinned by `null-credential-issuer-refused-not-dropped` and
+  `null-signed-excluded-signer-dids-refused-not-dropped`.
+- New `verify_webauthn_witness(&WebAuthnWitness, &WebAuthnWitnessExpectation) -> Result<(), String>`
+  verifies one WebAuthn assertion on its own (DER SPKI or COSE_Key P-256 key, one or more
+  expected origins), sharing the receipt path's assertion check. Pinned by the shared
+  `webauthnWitness` parity cases. On both paths a decoder or key-parser failure is now reported as
+  "WebAuthn verification failed: …" (the COSE errors as "Invalid COSE public key format: …"), a
+  non-string or `null` `topOrigin` counts as differing from `origin`, and a missing or empty
+  authenticatorData/clientDataJSON is refused before the expectations are read.
+- A WebAuthn assertion signature must be ASN.1 DER, as in every other port; the raw r||s encoding
+  is refused (bare-key ES256 witnesses still accept both). Pinned by `webauthn-raw-signature-refused`.
+- An empty `expected.nonce` is refused by `verify_approval_receipt*` and `verify_platform_receipt`
+  ("expected.nonce is required — it must be the challenge YOU issued (DIV §5 step 10)"),
+  immediately before the nonce comparison.
+- Refusal texts that name an API use the Rust names recorded in
+  `mcp-schemas/vectors/api-name-hints.json` (e.g. `VerifyOptions { allow_expired: true, .. }`,
+  `ApproverTrustAnchor::DidsMultiKey { dids, resolve }`, `verify_delegation`); the rest of each
+  text is the reference's. Platform and authority now give the reference's full `expected.target`,
+  `expected.agent_did`, `expected.rp_id` and RP-ID-conflict reasons.
+- `verify_approval_receipt*` refuses an agent-authority or platform-intent payload with its own
+  message, and refuses an empty `expected.target` before reconstruction.
+- Approval/authority/platform report the last candidate key's own failure, and an ES256 failure is
+  always "signature does not verify against the trusted signer key". An ES256 trusted key must be
+  SPKI DER (a raw SEC1 point no longer verifies, as in the reference).
+- Candidate-key refusals follow the reference: DID membership before delegation naming, `(unknown)`
+  for a missing signer DID, and the self-certifying "no public key" / "does not hash" reasons.
+- Requirement floors: one malformed-floor reason, and exclusion coverage ("it omits a required
+  signer exclusion") is checked before the quorum and flags.
+- Agent authority: a missing or invalid `parentReceiptHash` is "authority is missing a valid parent
+  receipt commitment", checked before the action patterns. Agent intents: nbf, then the
+  irreversible/AUTO_APPROVED refusal (as its own reason), then the delegated-authority chain.
+- Platform receipts no longer refuse early on a missing `expected_origin` (each WebAuthn witness
+  refuses instead), and refuse empty `signedAt`/`expiresAt` as missing.
+- Parity with the TypeScript reference (pinned by exact `reason` fields in
+  `verifier-parity-vectors.json`):
+  - Identity extensions are checked after the quorum minimum and before the signer class, with
+    separate reasons for a malformed exclusion set ("signed requirement.excludedSignerDids must be
+    an array of valid DIDs") and a repeated DID ("... must not contain duplicates").
+  - Four-eyes witness refusals use the reference text ("four-eyes: requester <did> cannot approve
+    their own action" / "cannot delegate to themselves" / "cannot seal their own request").
+  - Tenant/version gate: reference reasons and order (expected tenant before signed tenant;
+    unparseable JSON reported as `unsupported DIV payload version (unparseable)`).
+  - Reference reasons for key-only four-eyes, AUTO_APPROVED, missing signature material, agent
+    context in the wrong direction, platform/authority auto-approval, and RFC 3339 timestamps (no
+    "UTC" suffix); witness-count and anchor-shape checks moved to the reference's position.
+  - A delegation at use time checks its tenant first ("delegation and approval belong to different
+    tenants") and its requester right after the receipt's requester; `expected.requester_did` is
+    compared after the byte comparison and expiry.
+  - Offline and delegation windows are computed to the millisecond, as the reference does, and
+    printed with JavaScript `toFixed(1)` rounding. `delegatedTo: []` now reaches the
+    distinct-operator refusal; a non-string entry refuses the set; `delegatedQuorum: 2.0` is accepted.
+
+- A DID-mode resolver that throws (panics) while resolving an EXCLUDED identity's keys now refuses
+  the verification instead of contributing no keys; returning no keys is unchanged.
+- Requirement floors now refuse malformed `excluded_signer_dids` as malformed.
+- Approval requirements can bind `excludedSignerDids`, requester identities can bind a
+  `credentialIssuerDid`, and relying-party floors enforce exclusion-set presence and coverage.
+  Keys the DID resolver binds to an excluded identity are pre-counted, so an eligible DID signing under one is refused (DIV §4.4.6).
+- `require_execution_confirmed` now fails closed on any covered `COMMITMENT_ONLY` entry; ordinary
+  inclusion verification remains compatible and reports the redaction.
 
 ## [2.1.0]
 

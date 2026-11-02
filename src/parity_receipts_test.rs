@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn merged(base: &Value, overrides: &Value) -> Value {
@@ -15,6 +16,55 @@ fn floor(raw: &Value) -> Option<RequirementFloor> {
         return None;
     }
     Some(serde_json::from_value(raw.clone()).unwrap())
+}
+
+/// A floor whose flags are not booleans (`enrolled-device-floor-malformed-refused`:
+/// `requireEnrolledDevice: "yes"`) cannot reach the API at all: `RequirementFloor`'s flags are
+/// `bool`, so the type boundary is this port's refusal. Such a case must be one the reference
+/// refuses as a malformed floor; anything else unparseable is a harness bug and fails loudly.
+/// Returns true when the case was settled here.
+fn floor_refused_by_type(case: &Value, e: &Value) -> bool {
+    let raw = &e["requirement"];
+    if raw.is_null() || serde_json::from_value::<RequirementFloor>(raw.clone()).is_ok() {
+        return false;
+    }
+    let want = "expected.requirement is malformed";
+    assert_eq!(case["ok"].as_bool(), Some(false), "{}", case["name"]);
+    assert!(
+        case["reasonIncludes"]
+            .as_str()
+            .or(case["reason"].as_str())
+            .is_some_and(|reason| reason.starts_with(want)),
+        "{}: an unrepresentable floor must be a malformed-floor refusal",
+        case["name"]
+    );
+    true
+}
+
+/// `expected.enrolledDeviceKeys` for an approval case (DIV §4.3.2): `enrolledDeviceKeyIds` map
+/// through the section's keys to SPKI; a literal `enrolledDeviceKeys` is passed verbatim; absent
+/// means `None`, exactly as the reference spreads `expected`.
+fn enrolled_device_keys(e: &Value, keys: &BTreeMap<String, Value>) -> Option<Vec<String>> {
+    if let Some(ids) = e["enrolledDeviceKeyIds"].as_array() {
+        return Some(
+            ids.iter()
+                .map(|id| {
+                    keys[id.as_str().unwrap()]["spkiB64"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect(),
+        );
+    }
+    e.get("enrolledDeviceKeys").map(|literal| {
+        literal
+            .as_array()
+            .expect("a literal enrolledDeviceKeys is an array")
+            .iter()
+            .map(|key| key.as_str().expect("of strings").to_owned())
+            .collect()
+    })
 }
 
 fn options(raw: &Value) -> VerifyOptions {
@@ -72,6 +122,97 @@ fn shared_verifier_input_hardening_receipts() {
     run_authority_cases(&section["agentAuthority"], &keys);
 }
 
+/// The vectors' reasons name TypeScript APIs; rewrite them to this port's own names
+/// (packages/mcp-schemas/vectors/api-name-hints.json): every token, longest first, becomes a
+/// placeholder, then every placeholder becomes the Rust spelling — one pass, never rescanned.
+pub(crate) fn localized(text: &str) -> String {
+    let hints: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vectors/api-name-hints.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let tokens: Vec<&str> = hints["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    let map = hints["rust"].as_object().unwrap();
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    let mut want = tokens.clone();
+    keys.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(
+        keys, want,
+        "the Rust api-name map must name exactly the shared tokens"
+    );
+    let mut order = tokens.clone();
+    order.sort_by(|a, b| b.len().cmp(&a.len()));
+    let mut out = text.to_string();
+    for (i, token) in order.iter().enumerate() {
+        out = out.replace(token, &format!("\u{0}{i}\u{0}"));
+    }
+    for (i, token) in order.iter().enumerate() {
+        out = out.replace(&format!("\u{0}{i}\u{0}"), map[*token].as_str().unwrap());
+    }
+    out
+}
+
+/// `reasonIncludes` (substring) and `reason` (exact reference text), whenever a case carries them,
+/// after rewriting the TypeScript API names to Rust's.
+fn assert_reason_fields<T: std::fmt::Debug>(case: &Value, result: &Result<T, String>) {
+    let reason = result.as_ref().err().map(String::as_str);
+    if let Some(fragment) = case["reasonIncludes"].as_str() {
+        let fragment = localized(fragment);
+        assert!(
+            reason.is_some_and(|r| r.contains(&fragment)),
+            "{}: reason {reason:?} does not contain {fragment:?}",
+            case["name"]
+        );
+    }
+    if let Some(exact) = case["reason"].as_str() {
+        assert_eq!(
+            reason,
+            Some(localized(exact).as_str()),
+            "{}: exact reason",
+            case["name"]
+        );
+    }
+}
+
+/// A resolver-less DID anchor (`resolverOmitted`) is not expressible in Rust: both DID-mode
+/// variants carry a resolver by type. The harness uses the closest equivalent, a resolver that knows
+/// no keys, and expects what the reference reports for THAT anchor: the "provides no resolver" clause
+/// becomes "no trusted key could be resolved for <did>". Everything else in the reason is compared
+/// exactly.
+const RESOLVER_OMITTED: &str =
+    " is not self-certifying (did:intyga:key:…) and the trust anchor provides no resolveKey";
+
+fn assert_resolver_omitted<T: std::fmt::Debug>(case: &Value, result: &Result<T, String>) {
+    let exact = case["reason"]
+        .as_str()
+        .expect("a resolverOmitted case pins its exact reason");
+    let at = exact
+        .find(RESOLVER_OMITTED)
+        .expect("a resolverOmitted reason names the missing resolver");
+    let did_start = exact[..at].rfind(['(', ' ']).map_or(0, |i| i + 1);
+    let did = &exact[did_start..at];
+    let rewritten = format!(
+        "{}no trusted key could be resolved for {did}{}",
+        &exact[..did_start],
+        &exact[at + RESOLVER_OMITTED.len()..]
+    );
+    assert_eq!(
+        result.as_ref().err().map(String::as_str),
+        Some(localized(&rewritten).as_str()),
+        "{}: exact reason (resolver-less anchor emulated)",
+        case["name"]
+    );
+}
+
 fn key_table(raw: &Value) -> BTreeMap<String, Value> {
     raw.as_array()
         .unwrap()
@@ -83,6 +224,9 @@ fn key_table(raw: &Value) -> BTreeMap<String, Value> {
 fn run_approval_cases(section: &Value, keys: &BTreeMap<String, Value>) {
     for case in section["cases"].as_array().unwrap() {
         let e = merged(&section["expected"], &case["expected"]);
+        if floor_refused_by_type(case, &e) {
+            continue;
+        }
         // A WEBAUTHN witness verifies under the credential's COSE_Key; such cases say so explicitly.
         let encoding = if case["approverKeyEncoding"].as_str() == Some("cose") {
             "coseB64"
@@ -120,9 +264,31 @@ fn run_approval_cases(section: &Value, keys: &BTreeMap<String, Value>) {
                 })
                 .collect::<BTreeMap<_, _>>();
             let dids = resolved.keys().cloned().collect::<Vec<_>>();
-            ApproverTrustAnchor::DidsMultiKey {
-                dids,
-                resolve: Box::new(move |did| resolved.get(did).cloned().unwrap_or_default()),
+            // Harness instruction: the resolver panics (the Rust analogue of throwing) for these.
+            let throws_for = e["resolverThrowsFor"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>();
+            if e["resolverOmitted"].as_bool() == Some(true) {
+                // Rust has no resolver-less DID anchor; the closest equivalent is a DID-mode
+                // anchor whose resolver knows no keys (see `RESOLVER_OMITTED` below).
+                ApproverTrustAnchor::DidsMultiKey {
+                    dids,
+                    resolve: Box::new(|_| Vec::new()),
+                }
+            } else {
+                ApproverTrustAnchor::DidsMultiKey {
+                    dids,
+                    resolve: Box::new(move |did| {
+                        if throws_for.contains(did) {
+                            panic!("resolver unavailable for {did}");
+                        }
+                        resolved.get(did).cloned().unwrap_or_default()
+                    }),
+                }
             }
         } else {
             ApproverTrustAnchor::PublicKeys(
@@ -146,9 +312,11 @@ fn run_approval_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             nonce: e["nonce"].as_str().unwrap().into(),
             action_type: e["actionType"].as_str().unwrap().into(),
             params: e["params"].clone(),
-            requester_did: None,
+            requester_did: e["requesterDid"].as_str().map(str::to_owned),
             approvers,
-            tenant_id: None,
+            // Absent means omitted, exactly as the reference spreads `expected`.
+            tenant_id: e["tenantId"].as_str().map(str::to_owned),
+            enrolled_device_keys: enrolled_device_keys(&e, keys),
         };
         let receipt: ApprovalReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
         let opts = options(&merged(&section["options"], &case["options"]));
@@ -166,13 +334,10 @@ fn run_approval_cases(section: &Value, keys: &BTreeMap<String, Value>) {
         );
         // A refusal that lands for the wrong reason, or an acceptance crediting the wrong
         // identities, is the divergence these fixtures exist to catch.
-        if let Some(fragment) = case["reasonIncludes"].as_str() {
-            let reason = result.clone().unwrap_err();
-            assert!(
-                reason.contains(fragment),
-                "{}: reason {reason:?} does not contain {fragment:?}",
-                case["name"]
-            );
+        if e["resolverOmitted"].as_bool() == Some(true) {
+            assert_resolver_omitted(case, &result);
+        } else {
+            assert_reason_fields(case, &result);
         }
         if let Some(signers) = case.get("signers") {
             assert_eq!(
@@ -206,7 +371,7 @@ fn run_platform_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             rp_id: e["rpId"].as_str().unwrap().into(),
             nonce: e["nonce"].as_str().unwrap().into(),
             subject_external_id: e["subjectExternalId"].as_str().map(str::to_owned),
-            tenant_id: None,
+            tenant_id: e["tenantId"].as_str().map(str::to_owned),
         };
         let receipt: PlatformReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
         let result = verify_platform_receipt(
@@ -221,6 +386,7 @@ fn run_platform_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             case["name"],
             result
         );
+        assert_reason_fields(case, &result);
         if let Some(signers) = case.get("signers") {
             assert_eq!(
                 serde_json::to_value(result.unwrap()).unwrap(),
@@ -235,6 +401,9 @@ fn run_platform_cases(section: &Value, keys: &BTreeMap<String, Value>) {
 fn run_authority_cases(section: &Value, keys: &BTreeMap<String, Value>) {
     for case in section["cases"].as_array().unwrap() {
         let e = merged(&section["expected"], &case["expected"]);
+        if floor_refused_by_type(case, &e) {
+            continue;
+        }
         let mappings: BTreeMap<String, Vec<String>> = e["approverDids"]
             .as_object()
             .unwrap()
@@ -276,7 +445,7 @@ fn run_authority_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             target: e["target"].as_str().unwrap().into(),
             agent_did: e["agentDid"].as_str().unwrap().into(),
             requirement: floor(&e["requirement"]),
-            tenant_id: None,
+            tenant_id: e["tenantId"].as_str().map(str::to_owned),
         };
         let receipt: ApprovalReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
         let result = verify_agent_authority(
@@ -291,9 +460,7 @@ fn run_authority_cases(section: &Value, keys: &BTreeMap<String, Value>) {
             case["name"],
             result
         );
-        if let (Err(reason), Some(needle)) = (&result, case["reasonIncludes"].as_str()) {
-            assert!(reason.contains(needle), "{}: {reason}", case["name"]);
-        }
+        assert_reason_fields(case, &result);
         if let Ok(authority) = result {
             if let Some(signers) = case.get("signers") {
                 assert_eq!(
@@ -366,6 +533,7 @@ fn tenant_expected(
         approvers: anchor,
         requirement: floor(&raw["requirement"]),
         tenant_id: tenant_id.map(str::to_owned),
+        enrolled_device_keys: enrolled_device_keys(raw, keys),
     }
 }
 
@@ -616,11 +784,21 @@ fn shared_canonical_authority_and_platform_builders() {
 /// DEWP §4.7 (version 1.1): the shared `executionEvidence` section, run exactly as TS runs it.
 #[test]
 fn shared_execution_evidence_vectors() {
-    use crate::bundle::{verify_bundle_with_evidence, verify_evidence_bundle_with_execution, BundleVerifyOptions, EvidenceBundle, EvidenceVerifyOptions, ProofBundle};
-    use crate::execution::{canonical_execution_evidence_statement, parse_execution_evidence_statement, ExecutionEvidencePolicy, ExecutionEvidenceStatement, ExecutionOptions, SourceContinuity};
+    use crate::bundle::{
+        verify_bundle_with_evidence, verify_evidence_bundle_with_execution, BundleVerifyOptions,
+        EvidenceBundle, EvidenceVerifyOptions, ProofBundle,
+    };
+    use crate::execution::{
+        canonical_execution_evidence_statement, parse_execution_evidence_statement,
+        ExecutionEvidencePolicy, ExecutionEvidenceStatement, ExecutionOptions, SourceContinuity,
+    };
     use crate::ledger::{AnchorPolicy, AnchorQuorum, ExternalAnchorKeys, SignedAnchor};
     let vectors: Value = serde_json::from_str(
-        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/vectors/verifier-parity-vectors.json")).unwrap(),
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vectors/verifier-parity-vectors.json"
+        ))
+        .unwrap(),
     )
     .unwrap();
     let section = &vectors["executionEvidence"];
@@ -628,7 +806,13 @@ fn shared_execution_evidence_vectors() {
         v.as_array()
             .unwrap()
             .iter()
-            .map(|r| (r["seq"].as_str().unwrap().into(), r["status"].as_str().unwrap().into(), r["trusted"].as_bool().unwrap()))
+            .map(|r| {
+                (
+                    r["seq"].as_str().unwrap().into(),
+                    r["status"].as_str().unwrap().into(),
+                    r["trusted"].as_bool().unwrap(),
+                )
+            })
             .collect()
     };
     let no_resolver = |_: &SignedAnchor| -> Option<String> { None };
@@ -640,7 +824,11 @@ fn shared_execution_evidence_vectors() {
         let bundle: EvidenceBundle = serde_json::from_value(c["bundle"].clone()).unwrap();
         let roots: Vec<String> = serde_json::from_value(o["trustedRoots"].clone()).unwrap();
         let eo = EvidenceVerifyOptions {
-            signature_policy: if o["signaturePolicy"].is_null() { None } else { Some(serde_json::from_value(o["signaturePolicy"].clone()).unwrap()) },
+            signature_policy: if o["signaturePolicy"].is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(o["signaturePolicy"].clone()).unwrap())
+            },
             require_signatures: false,
             trusted_roots: Some(&roots),
             anchors: None,
@@ -667,7 +855,14 @@ fn shared_execution_evidence_vectors() {
             trusted_checkpoints: None,
         };
         let x = ExecutionOptions {
-            evidence_policy: if o["evidencePolicy"].is_null() { None } else { Some(serde_json::from_value::<ExecutionEvidencePolicy>(o["evidencePolicy"].clone()).unwrap()) },
+            evidence_policy: if o["evidencePolicy"].is_null() {
+                None
+            } else {
+                Some(
+                    serde_json::from_value::<ExecutionEvidencePolicy>(o["evidencePolicy"].clone())
+                        .unwrap(),
+                )
+            },
             require_execution_confirmed: o["requireExecutionConfirmed"].as_bool().unwrap_or(false),
             now_ms: Some(crate::execution::dewp_timestamp_ms(&o["now"]).unwrap()),
             skew_seconds: o["skewSeconds"].as_i64(),
@@ -675,11 +870,33 @@ fn shared_execution_evidence_vectors() {
         };
         let r = verify_evidence_bundle_with_execution(&bundle, &eo, &x);
         assert_eq!(r.ok, c["ok"].as_bool().unwrap(), "{name}: {:?}", r.failed);
-        let by_nonce: BTreeMap<String, String> = r.execution.by_nonce.iter().map(|(n, v)| (n.clone(), v.status.clone())).collect();
-        let want: BTreeMap<String, String> = serde_json::from_value(c["execution"]["byNonce"].clone()).unwrap();
+        if let Some(n) = c.get("contentVerified").and_then(Value::as_u64) {
+            assert_eq!(r.content_verified, n as usize, "{name}: contentVerified");
+        }
+        if let Some(n) = c.get("commitmentOnly").and_then(Value::as_u64) {
+            assert_eq!(r.commitment_only, n as usize, "{name}: commitmentOnly");
+        }
+        let by_nonce: BTreeMap<String, String> = r
+            .execution
+            .by_nonce
+            .iter()
+            .map(|(n, v)| (n.clone(), v.status.clone()))
+            .collect();
+        let want: BTreeMap<String, String> =
+            serde_json::from_value(c["execution"]["byNonce"].clone()).unwrap();
         assert_eq!(by_nonce, want, "{name}: byNonce");
-        let got: Vec<(String, String, bool)> = r.execution.checks.iter().map(|(s, k)| (s.clone(), k.status.clone(), k.trusted)).collect();
-        assert_eq!(got, rows(&c["execution"]["checks"]), "{name}: checks {:?}", r.execution.checks);
+        let got: Vec<(String, String, bool)> = r
+            .execution
+            .checks
+            .iter()
+            .map(|(s, k)| (s.clone(), k.status.clone(), k.trusted))
+            .collect();
+        assert_eq!(
+            got,
+            rows(&c["execution"]["checks"]),
+            "{name}: checks {:?}",
+            r.execution.checks
+        );
         // Every §4.7.4 finding the case pins: late and untrusted contradictions, dispatch conflicts,
         // the window cap per nonce and per-source continuity.
         let f = &c["execution"]["findings"];
@@ -767,11 +984,22 @@ fn shared_execution_evidence_vectors() {
             resolve_anchor_key: Some(&no_resolver),
             ..Default::default()
         };
-        let policy: Option<ExecutionEvidencePolicy> = if o["evidencePolicy"].is_null() { None } else { Some(serde_json::from_value(o["evidencePolicy"].clone()).unwrap()) };
+        let policy: Option<ExecutionEvidencePolicy> = if o["evidencePolicy"].is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(o["evidencePolicy"].clone()).unwrap())
+        };
         let r = verify_bundle_with_evidence(&bundle, &bo, policy.as_ref());
         assert!(r.properties.content_verified, "{name}");
         let got = r.execution.map(|e| (e.status, e.trusted));
-        let want = if c["execution"].is_null() { None } else { Some((c["execution"]["status"].as_str().unwrap().to_string(), c["execution"]["trusted"].as_bool().unwrap())) };
+        let want = if c["execution"].is_null() {
+            None
+        } else {
+            Some((
+                c["execution"]["status"].as_str().unwrap().to_string(),
+                c["execution"]["trusted"].as_bool().unwrap(),
+            ))
+        };
         assert_eq!(got, want, "{name}");
     }
     for c in section["statements"].as_array().unwrap() {
@@ -792,5 +1020,115 @@ fn shared_execution_evidence_vectors() {
         })
         .unwrap();
         assert_eq!(bytes, c["bytes"].as_str().unwrap(), "builder {}", c["name"]);
+    }
+}
+
+/// The `delegation` section: a seal verified with `verify_delegation` against a DID-mode anchor.
+#[test]
+fn shared_delegation_seals() {
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vectors/verifier-parity-vectors.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    run_delegation_cases(&vectors["delegation"], &key_table(&vectors["keys"]));
+}
+
+/// The `enrolledDevice` section (DIV §4.3.2 enrolled approver devices): its own keys; approvals
+/// through the approval harness (with `expected.enrolled_device_keys`), and the delegation and
+/// agent-authority kinds, which can never carry the field.
+#[test]
+fn shared_enrolled_device_vectors() {
+    let vectors: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vectors/verifier-parity-vectors.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let section = &vectors["enrolledDevice"];
+    let keys = key_table(&section["keys"]);
+    for part in ["approvals", "delegation", "agentAuthority"] {
+        assert!(
+            !section[part]["cases"].as_array().unwrap().is_empty(),
+            "{part}"
+        );
+    }
+    run_approval_cases(&section["approvals"], &keys);
+    run_delegation_cases(&section["delegation"], &keys);
+    run_authority_cases(&section["agentAuthority"], &keys);
+}
+
+fn run_delegation_cases(section: &Value, keys: &BTreeMap<String, Value>) {
+    let cases = section["cases"].as_array().expect("a delegation section");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let e = merged(&section["expected"], &case["expected"]);
+        if floor_refused_by_type(case, &e) {
+            continue;
+        }
+        let mappings: BTreeMap<String, Vec<String>> = e["approverDids"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(did, ids)| {
+                (
+                    did.clone(),
+                    ids.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| {
+                            keys[id.as_str().unwrap()]["spkiB64"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let expected = Expected {
+            target: e["target"].as_str().unwrap().into(),
+            nonce: String::new(),
+            action_type: e["actionType"].as_str().unwrap().into(),
+            params: e["params"].clone(),
+            requester_did: e["requesterDid"].as_str().map(str::to_owned),
+            approvers: ApproverTrustAnchor::DidsMultiKey {
+                dids: mappings.keys().cloned().collect(),
+                resolve: Box::new(move |did| mappings.get(did).cloned().unwrap_or_default()),
+            },
+            requirement: floor(&e["requirement"]),
+            tenant_id: e["tenantId"].as_str().map(str::to_owned),
+            enrolled_device_keys: None,
+        };
+        let receipt: ApprovalReceipt = serde_json::from_value(case["receipt"].clone()).unwrap();
+        let result = verify_delegation(
+            &receipt,
+            &expected,
+            &options(&merged(&section["options"], &case["options"])),
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["ok"].as_bool().unwrap(),
+            "{}: {:?}",
+            case["name"],
+            result
+        );
+        assert_reason_fields(case, &result);
+        if let Ok(d) = result {
+            if let Some(signers) = case.get("signers") {
+                assert_eq!(json!(d.signers), *signers, "{}", case["name"]);
+            }
+            if let Some(to) = case.get("delegatedTo") {
+                assert_eq!(json!(d.delegated_to), *to, "{}", case["name"]);
+            }
+            if let Some(q) = case.get("delegatedQuorum") {
+                assert_eq!(json!(d.delegated_quorum), *q, "{}", case["name"]);
+            }
+        }
     }
 }

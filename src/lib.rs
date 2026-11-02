@@ -19,6 +19,7 @@ pub mod ledger;
 pub mod rekor;
 pub mod rfc3161;
 mod webauthn;
+pub use webauthn::{verify_webauthn_witness, WebAuthnWitness, WebAuthnWitnessExpectation};
 
 /// DIV protocol version (docs/DIV.md v1).
 pub const DIV_VERSION: i64 = 1;
@@ -220,6 +221,57 @@ pub struct ApprovalRequirement {
     pub requester_cannot_approve: bool,
     #[serde(default)]
     pub signer_class: String,
+    /// An explicit `null` deserializes to `Some([""])`, never `None`: see [`null_dids_are_malformed`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "null_dids_are_malformed"
+    )]
+    pub excluded_signer_dids: Option<Vec<String>>,
+    /// DIV §4.3.2 "Enrolled approver devices". `None` is absent ("not required"); `Some(true)`
+    /// requires an ES256 witness under one of the caller's `Expected::enrolled_device_keys`. A
+    /// PRESENT value other than `true` (`false`, `null`, any non-boolean) deserializes to
+    /// `Some(false)`, which every verifier refuses as malformed (see
+    /// [`present_value_is_true_or_malformed`]). The builders emit the member only for `Some(true)`,
+    /// as the literal `true`, so historical payloads keep their exact bytes; only the ordinary
+    /// (`div-intent-verification`) builders accept it, and never with a hardware requirement.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value_is_true_or_malformed"
+    )]
+    pub require_enrolled_device: Option<bool>,
+}
+
+// Present-but-null is malformed, not absent (DIV §4.3.2: "Malformed optional fields MUST be refused,
+// not dropped"). serde reads an explicit `null` into `None` — the absent case — so a receipt the
+// TypeScript and Python verifiers refuse would verify here. `deserialize_with` runs only when the key
+// is present, so these map a present `null` to a value that is not a DID: the empty string. The
+// identity-extension check and the builders then refuse it with the reference's exact reasons. No
+// public field changes type, so struct literals and absent fields behave as before.
+fn null_did_is_malformed<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Some(
+        Option::<String>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
+}
+
+fn null_dids_are_malformed<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(Some(
+        Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_else(|| vec![String::new()]),
+    ))
+}
+
+// A PRESENT `requireEnrolledDevice` is `true` or malformed (DIV §4.3.2: absent, never `false`).
+// Read as a raw `Value` so `null` and a non-boolean are refused with the reference's reason instead of
+// failing the whole requirement parse (or, for `null`, reading as absent).
+fn present_value_is_true_or_malformed<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    Ok(Some(Value::deserialize(deserializer)? == Value::Bool(true)))
 }
 
 impl ApprovalRequirement {
@@ -231,9 +283,17 @@ impl ApprovalRequirement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RequesterIdentity {
     pub did: String,
     pub attestation: Option<RequesterAttestation>,
+    /// An explicit `null` deserializes to `Some("")`, never `None`: see [`null_did_is_malformed`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "null_did_is_malformed"
+    )]
+    pub credential_issuer_did: Option<String>,
 }
 
 /// One approver's signature over the canonical payload.
@@ -354,7 +414,7 @@ pub struct AgentAuthorityExpectation {
 ///
 /// Only strictly weaker signed values are refused; an equal or stricter one passes and the SIGNED
 /// value is then enforced. `allowed_aaguids` is not floored — express that as `require_hardware_key`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequirementFloor {
     /// Integer ≥ 1. The signed `requiredApprovals` must be at least this.
@@ -365,6 +425,11 @@ pub struct RequirementFloor {
     /// When true, the signed requirement must also demand a hardware key.
     #[serde(default)]
     pub require_hardware_key: bool,
+    /// When true, the signed requirement must also demand an enrolled approver device (DIV §4.3.2).
+    #[serde(default)]
+    pub require_enrolled_device: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_signer_dids: Option<Vec<String>>,
 }
 
 /// The reason stem every port uses for a signed requirement below the caller's floor.
@@ -378,11 +443,33 @@ fn check_requirement_floor(
     floor: Option<&RequirementFloor>,
 ) -> Result<(), String> {
     let Some(floor) = floor else { return Ok(()) };
-    if floor.required_approvals < 1 {
+    // A malformed floor fails closed, as in the reference (`validSignerExclusions`); a repeated DID
+    // is accepted, because the floor is a set the signed exclusions must cover.
+    if floor.required_approvals < 1
+        || floor
+            .excluded_signer_dids
+            .as_ref()
+            .is_some_and(|dids| dids.iter().any(|did| !valid_optional_did(did)))
+    {
         return Err(
-            "expected.requirement is malformed: required_approvals must be an integer of at least 1"
+            "expected.requirement is malformed: requiredApprovals must be an integer of at least 1 and the flags booleans"
                 .to_string(),
         );
+    }
+    // Coverage of the floor's exclusions first, then the quorum and flags — the reference's order.
+    if let Some(required) = &floor.excluded_signer_dids {
+        let covered = signed
+            .excluded_signer_dids
+            .as_ref()
+            .is_some_and(|signed_excluded| {
+                signed_excluded.iter().all(|did| valid_optional_did(did))
+                    && required.iter().all(|did| signed_excluded.contains(did))
+            });
+        if !covered {
+            return Err(format!(
+                "{WEAKER_REQUIREMENT_REASON}: it omits a required signer exclusion"
+            ));
+        }
     }
     if signed.required_approvals < floor.required_approvals {
         return Err(format!(
@@ -400,7 +487,62 @@ fn check_requirement_floor(
             "{WEAKER_REQUIREMENT_REASON}: it does not require a hardware key (DIV §5 step 3d)"
         ));
     }
+    if floor.require_enrolled_device && signed.require_enrolled_device != Some(true) {
+        return Err(format!(
+            "{WEAKER_REQUIREMENT_REASON}: it does not require an enrolled approver device (DIV §5 step 3d)"
+        ));
+    }
     Ok(())
+}
+
+/// DIV §5 step 3e reasons. Identical text in every port (pinned by verifier-parity-vectors.json).
+pub const ENROLLED_DEVICE_MALFORMED_REASON: &str =
+    "requirement.requireEnrolledDevice must be omitted or true (DIV §4.3.2)";
+pub const ENROLLED_DEVICE_ORDINARY_ONLY_REASON: &str =
+    "requireEnrolledDevice is defined only for ordinary approval intents (DIV §4.3.2)";
+pub const ENROLLED_DEVICE_WITH_HARDWARE_REASON: &str =
+    "requireEnrolledDevice cannot be combined with requireHardwareKey or allowedAaguids (DIV §4.3.2)";
+pub const ENROLLED_DEVICE_KEYS_REQUIRED_REASON: &str =
+    "the signed policy requires an enrolled approver device; supply expected.enrolled_device_keys from your own enrollment records (DIV §4.3.2)";
+pub const ENROLLED_DEVICE_KEYS_MALFORMED_REASON: &str =
+    "expected.enrolled_device_keys must be an array of base64 public keys";
+
+/// DIV §5 step 3e, structural half: the field is absent, or exactly `true` on an ordinary intent
+/// with no hardware requirement. `ordinary` is whether the payload type is
+/// `div-intent-verification`. Read from the parsed signed requirement, so a present `false` or
+/// `null` (both `Some(false)` here) is refused rather than dropped.
+fn check_enrolled_device_structure(
+    requirement: &ApprovalRequirement,
+    ordinary: bool,
+) -> Result<(), String> {
+    match requirement.require_enrolled_device {
+        None => Ok(()),
+        Some(false) => Err(ENROLLED_DEVICE_MALFORMED_REASON.into()),
+        Some(true) if !ordinary => Err(ENROLLED_DEVICE_ORDINARY_ONLY_REASON.into()),
+        Some(true) if requirement.requires_hardware_credential() => {
+            Err(ENROLLED_DEVICE_WITH_HARDWARE_REASON.into())
+        }
+        Some(true) => Ok(()),
+    }
+}
+
+/// DIV §5 step 3e, list half: the caller's enrolled device keys as key fingerprints (so SPKI and COSE
+/// spellings of one key match, like the one-key-one-person rule), or the refusal. Consulted only
+/// under a signed `requireEnrolledDevice`; a malformed list is refused even then, never read as "no
+/// list". The reference's order: absent, then malformed entries, then empty.
+fn enrolled_device_fingerprints(
+    expected: &Expected,
+) -> Result<std::collections::HashSet<Vec<u8>>, String> {
+    let Some(keys) = &expected.enrolled_device_keys else {
+        return Err(ENROLLED_DEVICE_KEYS_REQUIRED_REASON.into());
+    };
+    if keys.iter().any(String::is_empty) {
+        return Err(ENROLLED_DEVICE_KEYS_MALFORMED_REASON.into());
+    }
+    if keys.is_empty() {
+        return Err(ENROLLED_DEVICE_KEYS_REQUIRED_REASON.into());
+    }
+    Ok(keys.iter().map(|key| signing_key_identity(key)).collect())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -465,6 +607,13 @@ pub struct Expected {
     pub requirement: Option<RequirementFloor>,
     /// Independently trusted tenant binding. Required for v2 receipts; supplying it refuses v1.
     pub tenant_id: Option<String>,
+    /// The enrolled approver device keys YOU trust (base64 SPKI or COSE), from your own enrollment
+    /// records — e.g. a console trust-anchor export's `enrolledDeviceKeys`. Consulted only when the
+    /// signed requirement sets `requireEnrolledDevice`: then a witness counts only if it is ES256 and
+    /// verified under one of these keys, and verification is refused without the list (DIV §4.3.2).
+    /// Each key must ALSO be a trusted approver key for its signer in `approvers`; this list narrows,
+    /// it never adds trust. `None` otherwise.
+    pub enrolled_device_keys: Option<Vec<String>>,
 }
 
 impl ApproverTrustAnchor {
@@ -493,11 +642,35 @@ impl ApproverTrustAnchor {
     ) -> Result<Vec<(String, String)>, String> {
         // A delegation names identities, and in `PublicKeys` mode `signerDid` is an unverified string —
         // enforcing `delegatedTo` against it would be security theatre. Refuse rather than pretend.
-        if restrict_to.is_some() {
-            if let ApproverTrustAnchor::PublicKeys(_) = self {
-                return Err("a delegation names approver identities, so it requires a DID-mode trust anchor; in PublicKeys mode signerDid is unverified and delegatedTo cannot be enforced".to_string());
+        // The order of checks and their texts follow the reference's `candidateKeys`.
+        let shown = if signer_did.is_empty() {
+            "(unknown)"
+        } else {
+            signer_did
+        };
+        let keys: Vec<String> = match self {
+            ApproverTrustAnchor::PublicKeys(keys) => {
+                if restrict_to.is_some() {
+                    return Err("a delegation names approver identities, so it requires a DID-mode trust anchor (ApproverTrustAnchor::DidsMultiKey { dids, resolve }); in ApproverTrustAnchor::PublicKeys mode signerDid is unverified and delegatedTo cannot be enforced".to_string());
+                }
+                if keys.is_empty() {
+                    return Err("trusted approver allowlist is empty".to_string());
+                }
+                return Ok(keys.iter().map(|k| (k.clone(), k.clone())).collect());
             }
-        }
+            ApproverTrustAnchor::Dids { dids, resolve } => {
+                if signer_did.is_empty() || !dids.iter().any(|d| d == signer_did) {
+                    return Err(format!("signer {shown} is not an authorized approver"));
+                }
+                resolve(signer_did).into_iter().collect()
+            }
+            ApproverTrustAnchor::DidsMultiKey { dids, resolve } => {
+                if signer_did.is_empty() || !dids.iter().any(|d| d == signer_did) {
+                    return Err(format!("signer {shown} is not an authorized approver"));
+                }
+                resolve(signer_did)
+            }
+        };
         if let Some(named) = restrict_to {
             if !named.iter().any(|d| d == signer_did) {
                 return Err(format!(
@@ -505,49 +678,28 @@ impl ApproverTrustAnchor {
                 ));
             }
         }
-        match self {
-            ApproverTrustAnchor::PublicKeys(keys) => {
-                if keys.is_empty() {
-                    return Err("trusted approver allowlist is empty".to_string());
-                }
-                Ok(keys.iter().map(|k| (k.clone(), k.clone())).collect())
-            }
-            ApproverTrustAnchor::Dids { dids, resolve } => {
-                if signer_did.is_empty() || !dids.iter().any(|d| d == signer_did) {
-                    return Err(format!("signer {signer_did} is not an authorized approver"));
-                }
-                match resolve(signer_did) {
-                    Some(key) => Ok(vec![(key, signer_did.to_string())]),
-                    None if signer_did.starts_with(SELF_CERTIFYING_DID_PREFIX)
-                        && self_certifying_did(presented_key).ok().as_deref()
-                            == Some(signer_did) =>
-                    {
-                        Ok(vec![(presented_key.into(), signer_did.into())])
-                    }
-                    None => Err(format!("no trusted key could be resolved for {signer_did}")),
-                }
-            }
-            ApproverTrustAnchor::DidsMultiKey { dids, resolve } => {
-                if signer_did.is_empty() || !dids.iter().any(|d| d == signer_did) {
-                    return Err(format!("signer {signer_did} is not an authorized approver"));
-                }
-                // All keys for one DID share that DID as their identity, so quorum still counts one.
-                let keys: Vec<(String, String)> = resolve(signer_did)
-                    .into_iter()
-                    .filter(|k| !k.is_empty())
-                    .map(|k| (k, signer_did.to_string()))
-                    .collect();
-                if keys.is_empty() {
-                    if signer_did.starts_with(SELF_CERTIFYING_DID_PREFIX)
-                        && self_certifying_did(presented_key).ok().as_deref() == Some(signer_did)
-                    {
-                        return Ok(vec![(presented_key.into(), signer_did.into())]);
-                    }
-                    return Err(format!("no trusted key could be resolved for {signer_did}"));
-                }
-                Ok(keys)
-            }
+        // All keys for one DID share that DID as their identity, so quorum still counts one.
+        let keys: Vec<(String, String)> = keys
+            .into_iter()
+            .filter(|k| !k.is_empty())
+            .map(|k| (k, signer_did.to_string()))
+            .collect();
+        if !keys.is_empty() {
+            return Ok(keys);
         }
+        // Self-certifying fallback: the DID itself commits to the enrolled key.
+        if signer_did.starts_with(SELF_CERTIFYING_DID_PREFIX) {
+            if presented_key.is_empty() {
+                return Err(format!(
+                    "witness carries no public key to validate against self-certifying {signer_did}"
+                ));
+            }
+            if self_certifying_did(presented_key).ok().as_deref() != Some(signer_did) {
+                return Err("witness public key does not hash to the pinned self-certifying DID (did:intyga:key), and the trust anchor names no keys for it".to_string());
+            }
+            return Ok(vec![(presented_key.into(), signer_did.into())]);
+        }
+        Err(format!("no trusted key could be resolved for {signer_did}"))
     }
 }
 
@@ -772,6 +924,7 @@ pub fn canonical_intent_payload(
     nonce: &str,
     expires_at: &str,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, true)?;
     stable_stringify(&canonical_intent_payload_value(
         target,
         action_type,
@@ -815,6 +968,7 @@ pub fn canonical_intent_payload_with_tenant(
     expires_at: &str,
     tenant_id: Option<&str>,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, true)?;
     canonical_payload_with_tenant(
         canonical_intent_payload_value(
             target,
@@ -864,6 +1018,7 @@ pub fn canonical_agent_intent_payload(
     exp: &str,
     context: &Value,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, true)?;
     stable_stringify(&canonical_agent_intent_payload_value(
         target,
         action_type,
@@ -890,6 +1045,7 @@ pub fn canonical_agent_intent_payload_with_tenant(
     context: &Value,
     tenant_id: Option<&str>,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, true)?;
     canonical_payload_with_tenant(
         canonical_agent_intent_payload_value(
             target,
@@ -912,7 +1068,8 @@ pub fn canonical_agent_intent_payload_with_tenant(
 /// builder but not the others is exactly the drift the golden vectors exist to catch.
 ///
 /// Infallible on purpose: it only BUILDS `Value`s (strings, bools, a u32 — none can be
-/// non-portable); the fallible serialization happens in the callers' [`stable_stringify`] pass.
+/// non-portable); the fallible serialization happens in the callers' [`stable_stringify`] pass, and
+/// every public builder runs [`validate_identity_extensions`] before it.
 fn canonical_common(
     requester: &RequesterIdentity,
     requirement: &ApprovalRequirement,
@@ -933,16 +1090,39 @@ fn canonical_common(
     // carries today, but a set sorted one way here and another in the TS reference produces
     // different SIGNED BYTES, caught by nothing until a receipt fails elsewhere. DIV §4.3.3.
     aaguids.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
-    (
-        serde_json::json!({ "did": requester.did, "attestation": attestation }),
-        serde_json::json!({
-            "requiredApprovals": requirement.required_approvals,
-            "requireHardwareKey": requirement.require_hardware_key,
-            "allowedAaguids": aaguids,
-            "requesterCannotApprove": requirement.requester_cannot_approve,
-            "signerClass": requirement.signer_class,
-        }),
-    )
+    let mut requester_value =
+        serde_json::json!({ "did": requester.did, "attestation": attestation });
+    if let Some(issuer) = &requester.credential_issuer_did {
+        requester_value
+            .as_object_mut()
+            .unwrap()
+            .insert("credentialIssuerDid".into(), Value::String(issuer.clone()));
+    }
+    let mut requirement_value = serde_json::json!({
+        "requiredApprovals": requirement.required_approvals,
+        "requireHardwareKey": requirement.require_hardware_key,
+        "allowedAaguids": aaguids,
+        "requesterCannotApprove": requirement.requester_cannot_approve,
+        "signerClass": requirement.signer_class,
+    });
+    if let Some(excluded) = &requirement.excluded_signer_dids {
+        let mut sorted = excluded.clone();
+        sorted.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+        sorted.dedup();
+        requirement_value
+            .as_object_mut()
+            .unwrap()
+            .insert("excludedSignerDids".into(), serde_json::json!(sorted));
+    }
+    // DIV §4.3.2: only ever the literal `true`; absent otherwise, so one policy has one encoding.
+    // The public builders refuse it on every kind but `div-intent-verification`.
+    if requirement.require_enrolled_device == Some(true) {
+        requirement_value
+            .as_object_mut()
+            .unwrap()
+            .insert("requireEnrolledDevice".into(), Value::Bool(true));
+    }
+    (requester_value, requirement_value)
 }
 
 /// Build a byte-identical OFFLINE APPROVAL payload (DIV §5a.2), pinned by the
@@ -996,6 +1176,7 @@ pub fn canonical_offline_intent_payload(
     challenged_at: &str,
     expires_at: &str,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     stable_stringify(&canonical_offline_intent_payload_value(
         target,
         action_type,
@@ -1022,6 +1203,7 @@ pub fn canonical_offline_intent_payload_with_tenant(
     expires_at: &str,
     tenant_id: Option<&str>,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     canonical_payload_with_tenant(
         canonical_offline_intent_payload_value(
             target,
@@ -1096,6 +1278,7 @@ pub fn canonical_delegation_payload(
     sealed_at: &str,
     expires_at: &str,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     stable_stringify(&canonical_delegation_payload_value(
         target,
         action_type,
@@ -1126,6 +1309,7 @@ pub fn canonical_delegation_payload_with_tenant(
     expires_at: &str,
     tenant_id: Option<&str>,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     canonical_payload_with_tenant(
         canonical_delegation_payload_value(
             target,
@@ -1156,6 +1340,7 @@ pub fn canonical_agent_authority_payload(
     sealed_at: &str,
     expires_at: &str,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     canonical_agent_authority_payload_with_parent(
         target,
         action_patterns,
@@ -1208,6 +1393,7 @@ pub fn canonical_agent_authority_payload_with_parent(
     expires_at: &str,
     parent_receipt_hash: Option<&str>,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     stable_stringify(&canonical_agent_authority_payload_value(
         target,
         action_patterns,
@@ -1236,6 +1422,7 @@ pub fn canonical_agent_authority_payload_with_parent_and_tenant(
     parent_receipt_hash: Option<&str>,
     tenant_id: Option<&str>,
 ) -> Result<String, String> {
+    validate_identity_extensions(requester, requirement, false)?;
     canonical_payload_with_tenant(
         canonical_agent_authority_payload_value(
             target,
@@ -1319,29 +1506,75 @@ fn canonical_str_field(canonical: &str, key: &str) -> Option<String> {
 /// Enforce tenant binding from caller-owned state. A receipt's tenant is only compared; it never
 /// supplies the expected value. V1 remains valid only for callers that did not assert a tenant.
 fn check_tenant_binding(value: &Value, expected: Option<&str>) -> Result<Option<String>, String> {
-    match value.get("v").and_then(Value::as_i64) {
-        Some(DIV_VERSION) => {
-            if expected.is_some() {
-                return Err("legacy v1 receipt cannot satisfy an expected tenant".into());
-            }
-            Ok(None)
+    // `typeof v === "number" ? v : 0` in the reference: an absent, non-numeric or unparseable
+    // version reads as 0 and is reported as "unparseable".
+    let version = value.get("v").and_then(Value::as_f64).unwrap_or(0.0);
+    if version == DIV_VERSION as f64 {
+        if expected.is_some() {
+            return Err(
+                "legacy DIV v1 payload cannot be verified with an expected tenantId".into(),
+            );
         }
-        Some(DIV_TENANT_VERSION) => {
-            let signed = value
-                .get("tenantId")
-                .and_then(Value::as_str)
-                .filter(|tenant| !tenant.is_empty())
-                .ok_or("v2 receipt is missing a non-empty tenantId")?;
-            let expected = expected
-                .filter(|tenant| !tenant.is_empty())
-                .ok_or("v2 receipt requires a caller-supplied non-empty tenant_id")?;
-            if signed != expected {
-                return Err("receipt is for a different tenant".into());
-            }
-            Ok(Some(signed.to_string()))
-        }
-        _ => Err("unsupported DIV payload version".into()),
+        return Ok(None);
     }
+    if version != DIV_TENANT_VERSION as f64 {
+        let shown = if version == 0.0 {
+            "unparseable".to_string()
+        } else {
+            value
+                .get("v")
+                .map(js_number_text)
+                .unwrap_or_else(|| "unparseable".into())
+        };
+        return Err(format!("unsupported DIV payload version ({shown})"));
+    }
+    let expected = expected
+        .filter(|tenant| !tenant.is_empty())
+        .ok_or("expected.tenant_id is required for tenant-bound DIV v2 payloads")?;
+    let signed = value
+        .get("tenantId")
+        .and_then(Value::as_str)
+        .filter(|tenant| !tenant.is_empty())
+        .ok_or("tenant-bound DIV v2 payload is missing a non-empty tenantId")?;
+    if signed != expected {
+        return Err("receipt was signed for a different tenant".into());
+    }
+    Ok(Some(signed.to_string()))
+}
+
+/// JavaScript's `Number.prototype.toFixed(1)` for a finite, non-negative value: the exact decimal
+/// value of the double, rounded half UP (Rust's `{:.1}` rounds an exact tie to even instead).
+fn js_to_fixed_1(value: f64) -> String {
+    if !value.is_finite() || value < 0.0 {
+        return format!("{value:.1}");
+    }
+    let exact = format!("{value:.1100}");
+    let (int_part, frac) = exact.split_once('.').unwrap_or((&exact, ""));
+    let mut tenth = u128::from(frac.as_bytes().first().map_or(0, |d| d - b'0'));
+    let mut int: u128 = int_part.parse().unwrap_or(0);
+    if frac.as_bytes().get(1).is_some_and(|d| *d >= b'5') {
+        tenth += 1;
+        if tenth == 10 {
+            tenth = 0;
+            int += 1;
+        }
+    }
+    format!("{int}.{tenth}")
+}
+
+/// A JSON number as JavaScript's `String(n)` prints it, for integers and ordinary fractions.
+fn js_number_text(v: &Value) -> String {
+    match v.as_f64() {
+        Some(f) if f.fract() == 0.0 && f.abs() < 1e21 => format!("{f:.0}"),
+        Some(f) => f.to_string(),
+        None => v.to_string(),
+    }
+}
+
+/// The parsed canonical payload, or `null` when it is not JSON — which the version gate then
+/// reports as an unparseable version, as the reference does.
+fn payload_probe(canonical: &str) -> Value {
+    serde_json::from_str(canonical).unwrap_or(Value::Null)
 }
 
 /// Parse a signed RFC 3339 timestamp to a Unix second count (fraction floored), or None.
@@ -1356,6 +1589,12 @@ fn check_tenant_binding(value: &Value, expected: Option<&str>) -> Result<Option<
 /// separators, a comma fraction, any number of fraction digits, `:60` and day 31 of any month,
 /// where the TS/Go/Java/Python ports disagreed with each other; all five now apply this grammar.
 pub(crate) fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
+    parse_rfc3339_utc_ms(s).map(|ms| ms.div_euclid(1000))
+}
+
+/// [`parse_rfc3339_utc_secs`] to the millisecond, as the reference's `Date.parse` reads it: the
+/// fraction's first three digits, truncated.
+pub(crate) fn parse_rfc3339_utc_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let digits = |from: usize, to: usize| -> Option<i64> {
         let part = b.get(from..to)?;
@@ -1394,10 +1633,18 @@ pub(crate) fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
     // An optional fraction of 1–9 digits (floored), then the zone: `Z`, or `±HH:MM` subtracted to
     // reach UTC.
     let mut rest = &b[19..];
+    let mut millis: i64 = 0;
     if rest.first() == Some(&b'.') {
         let n = rest[1..].iter().take_while(|c| c.is_ascii_digit()).count();
         if n == 0 || n > 9 {
             return None;
+        }
+        for i in 0..3 {
+            millis = millis * 10
+                + rest
+                    .get(1 + i)
+                    .filter(|_| i < n)
+                    .map_or(0, |d| i64::from(d - b'0'));
         }
         rest = &rest[1 + n..];
     }
@@ -1429,7 +1676,7 @@ pub(crate) fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hour * 3600 + min * 60 + sec - offset_secs)
+    Some((days * 86400 + hour * 3600 + min * 60 + sec - offset_secs) * 1000 + millis)
 }
 
 fn now_unix_secs() -> i64 {
@@ -1457,6 +1704,17 @@ pub fn verify_approval_receipt(
 ) -> Result<Vec<String>, String> {
     verify_approval_receipt_with_options(receipt, expected, &VerifyOptions::default())
 }
+
+/// Shared by every verifier port; `expected.nonce` is the one API name in it.
+const EXPECTED_NONCE_REQUIRED_REASON: &str =
+    "expected.nonce is required — it must be the challenge YOU issued (DIV §5 step 10)";
+
+/// The reference's refusal for a four-eyes or exclusion rule under a key-only anchor.
+const KEY_ONLY_FOUR_EYES_REASON: &str = "requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity";
+
+/// The default refusal of an `AUTO_APPROVED` receipt (no human signature to verify).
+const AUTO_APPROVED_REFUSED: &str =
+    "auto-approved by policy — no human signature to verify (pass VerifyOptions { allow_auto_approved: true, .. } to accept)";
 
 /// Validate `requirement.signerClass` out of the signed bytes (DIV §4.3.2). `"human"` is the only
 /// class defined today. FAIL CLOSED both ways: an absent class predates (or dropped) the field, and
@@ -1487,6 +1745,9 @@ fn check_signer_class(requirement: &ApprovalRequirement) -> Result<(), String> {
 fn check_evidence(canonical: &str) -> Result<(), String> {
     let probe: Value = serde_json::from_str(canonical)
         .map_err(|_| "the signed payload is not valid JSON".to_string())?;
+    if !probe.is_object() {
+        return Err("the signed payload is not a JSON object".to_string());
+    }
     match probe.get("evidence") {
         None => Err("the signed payload is missing evidence (DIV §4.3.4)".to_string()),
         Some(Value::Null) => Ok(()),
@@ -1508,6 +1769,91 @@ fn check_quorum_minimum(requirement: &ApprovalRequirement) -> Result<(), String>
         );
     }
     Ok(())
+}
+
+fn valid_optional_did(value: &str) -> bool {
+    value.len() <= 4096
+        && value.starts_with("did:")
+        && value.len() > 4
+        && !value.chars().any(|ch| ch <= '\u{20}' || ch == '\u{7f}')
+}
+
+/// The builders refuse malformed identity extensions (DIV §4.3.2) instead of signing them, as the
+/// reference does (`NonCanonicalValue`): bytes carrying them would be refused by every verifier.
+///
+/// `ordinary` is true only for the `div-intent-verification` builders (plain and agent): the one
+/// payload kind that may carry `requireEnrolledDevice`. Every other builder passes false, so a caller
+/// cannot sign a kind whose verifiers would refuse the field.
+fn validate_identity_extensions(
+    requester: &RequesterIdentity,
+    requirement: &ApprovalRequirement,
+    ordinary: bool,
+) -> Result<(), String> {
+    if requester
+        .credential_issuer_did
+        .as_deref()
+        .is_some_and(|did| !valid_optional_did(did))
+    {
+        return Err("credentialIssuerDid must be a valid DID".into());
+    }
+    if requirement
+        .excluded_signer_dids
+        .as_ref()
+        .is_some_and(|excluded| excluded.iter().any(|did| !valid_optional_did(did)))
+    {
+        return Err("excludedSignerDids must be a DID array".into());
+    }
+    // `Some(false)` is omitted, as the reference omits `false`; `Some(true)` is refused wherever DIV
+    // forbids it.
+    if requirement.require_enrolled_device == Some(true) {
+        if !ordinary {
+            return Err(ENROLLED_DEVICE_ORDINARY_ONLY_REASON.into());
+        }
+        if requirement.requires_hardware_credential() {
+            return Err(ENROLLED_DEVICE_WITH_HARDWARE_REASON.into());
+        }
+    }
+    Ok(())
+}
+
+fn check_excluded_signers(
+    requirement: &ApprovalRequirement,
+    requester: &RequesterIdentity,
+) -> Result<(), String> {
+    if requester
+        .credential_issuer_did
+        .as_deref()
+        .is_some_and(|did| !valid_optional_did(did))
+    {
+        return Err("signed requester.credentialIssuerDid must be a non-empty DID".into());
+    }
+    if let Some(excluded) = &requirement.excluded_signer_dids {
+        // Validity of every entry first, then duplicates: the reference's order and wording.
+        if excluded.iter().any(|did| !valid_optional_did(did)) {
+            return Err(
+                "signed requirement.excludedSignerDids must be an array of valid DIDs".into(),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        if excluded.iter().any(|did| !seen.insert(did)) {
+            return Err("signed requirement.excludedSignerDids must not contain duplicates".into());
+        }
+    }
+    Ok(())
+}
+
+fn signer_is_excluded(
+    requirement: &ApprovalRequirement,
+    requester: &RequesterIdentity,
+    signer: &str,
+) -> bool {
+    requirement
+        .excluded_signer_dids
+        .as_ref()
+        .is_some_and(|dids| dids.iter().any(|did| did == signer))
+        || (requirement.requester_cannot_approve
+            && (signer == requester.did
+                || requester.credential_issuer_did.as_deref() == Some(signer)))
 }
 
 /// The instant and skew tolerance every time-based check shares: expiry (DIV §6.2) and the
@@ -1550,13 +1896,8 @@ fn verify_approval_receipt_inner(
     opts: &VerifyOptions,
     agent_context: Option<&Value>,
 ) -> Result<Vec<String>, String> {
-    if receipt.canonical_payload.is_empty() {
-        return Err("missing canonicalPayload".to_string());
-    }
-
     // Version / type / nonce gate.
-    let probe: Value = serde_json::from_str(&receipt.canonical_payload)
-        .map_err(|_| "canonicalPayload is not valid JSON".to_string())?;
+    let probe = payload_probe(&receipt.canonical_payload);
     let tenant_id = check_tenant_binding(&probe, expected.tenant_id.as_deref())?;
     let payload_type = probe
         .get("type")
@@ -1566,7 +1907,18 @@ fn verify_approval_receipt_inner(
     // NO option that would let one through, because a delegation that could authorize its own action
     // would be exactly the pre-signed bearer capability the design exists to avoid.
     if payload_type == DIV_DELEGATION_TYPE {
-        return Err("this is a delegation, which authorizes no action on its own — verify it with verify_delegation and pass the result as opts.delegation, together with an offline approval signed by the delegated operators".to_string());
+        return Err("this is a delegation, which authorizes no action on its own — verify it with verify_delegation and pass the result as VerifyOptions { delegation: Some(..), .. }, together with an offline approval signed by the delegated operators".to_string());
+    }
+    // Same structural rule for an agent authority (DIV §5b) and a platform hash-only intent (DIV
+    // §5c): each is refused with its own message, pointing at the verifier that checks it.
+    if payload_type == DIV_AGENT_AUTHORITY_TYPE {
+        return Err("this is an agent authority, which authorizes no action on its own — verify it with verify_agent_authority; execution still requires an approval receipt".to_string());
+    }
+    if payload_type == DIV_PLATFORM_INTENT_TYPE {
+        return Err(
+            "this is a platform hash-only intent (DIV §5c) — verify it with verify_platform_receipt"
+                .to_string(),
+        );
     }
     // A DEWP execution-evidence statement (DEWP §4.7) is a source's observation AFTER execution, not
     // an approval. Refused with its own reason, like the other non-approval kinds.
@@ -1578,7 +1930,7 @@ fn verify_approval_receipt_inner(
         return Err("payload is not a div-intent-verification".to_string());
     }
     if offline && !opts.allow_offline {
-        return Err("this is an offline approval; set allow_offline at the specific call site permitted to run under one".to_string());
+        return Err("this is an offline approval; pass VerifyOptions { allow_offline: true, .. } at the specific call site permitted to run under one".to_string());
     }
     // A delegation only ever substitutes the approver set for an OFFLINE proof. Accepting it against an
     // ordinary gateway-mediated receipt would silently replace the quorum the gateway enforced.
@@ -1586,6 +1938,11 @@ fn verify_approval_receipt_inner(
         return Err(
             "a delegation can only substitute the approver set for an offline approval".to_string(),
         );
+    }
+    // Naming the challenge is the caller's job (DIV §5 steps 10-11): an empty nonce is refused rather
+    // than compared, or a payload signed over an empty nonce would satisfy a caller that issued none.
+    if expected.nonce.is_empty() {
+        return Err(EXPECTED_NONCE_REQUIRED_REASON.to_string());
     }
     let payload_nonce =
         canonical_str_field(&receipt.canonical_payload, "nonce").unwrap_or_default();
@@ -1601,17 +1958,22 @@ fn verify_approval_receipt_inner(
         .requester
         .as_ref()
         .ok_or("receipt missing requester")?;
-    if expected
-        .requester_did
-        .as_deref()
-        .is_some_and(|did| requester.did != did)
+    if opts
+        .delegation
+        .as_ref()
+        .is_some_and(|d| requester.did != d.requester_did)
     {
-        return Err("approval was requested by a different principal".into());
+        return Err(
+            "offline approval was requested by a different principal than the delegation".into(),
+        );
     }
 
     let agent_intent = probe.get("agent").is_some();
-    if agent_intent != agent_context.is_some() {
+    if agent_intent && agent_context.is_none() {
         return Err("agent receipt requires independently asserted PEP context".into());
+    }
+    if !agent_intent && agent_context.is_some() {
+        return Err("agent context was expected but is absent from the signed payload".into());
     }
     let expires_at = canonical_str_field(
         &receipt.canonical_payload,
@@ -1620,12 +1982,25 @@ fn verify_approval_receipt_inner(
     .filter(|s| !s.is_empty())
     .ok_or("receipt missing expiration")?;
     if agent_intent {
-        let from_ms = validate_agent_context(
-            agent_context.expect("checked above"),
-            &expires_at,
-            receipt.sig_alg.as_deref(),
-        )
-        .map_err(|problem| format!("invalid independently asserted agent context: {problem}"))?;
+        // The irreversible/AUTO_APPROVED rule is applied below, after the nbf check, as a refusal
+        // of its own — the reference's order and text.
+        let from_ms =
+            validate_agent_context(agent_context.expect("checked above"), &expires_at, None)
+                .map_err(|problem| {
+                    format!("invalid independently asserted agent context: {problem}")
+                })?;
+        let (now, skew) = evaluation_time(opts);
+        if from_ms > (now + skew) * 1000 {
+            return Err("agent approval is not valid yet".into());
+        }
+        let irreversible = agent_context
+            .and_then(|c| c.get("action"))
+            .and_then(|a| a.get("reversibility"))
+            .and_then(Value::as_str)
+            == Some("irreversible");
+        if irreversible && receipt.sig_alg.as_deref() == Some("AUTO_APPROVED") {
+            return Err("irreversible agent action requires a human signature".into());
+        }
         if let Some(delegated_by) = agent_context
             .and_then(|c| c.get("agent"))
             .and_then(|a| a.get("delegatedBy"))
@@ -1660,10 +2035,11 @@ fn verify_approval_receipt_inner(
                 opts,
             )?;
         }
-        let (now, skew) = evaluation_time(opts);
-        if from_ms > (now + skew) * 1000 {
-            return Err("agent approval is not valid yet".into());
-        }
+    }
+    // FAIL CLOSED on a missing target: defaulting to the receipt's own would have it vouch for its
+    // own scope (DIV Target Isolation).
+    if expected.target.is_empty() {
+        return Err("expected.target is required — it must be YOUR target identifier, asserted independently of the receipt (DIV Target Isolation)".into());
     }
 
     // The requirement is part of the SIGNED bytes, so a third party cannot alter it: a forged value
@@ -1676,7 +2052,12 @@ fn verify_approval_receipt_inner(
             .and_then(|v| serde_json::from_value(v).ok())
             .ok_or("receipt payload is missing the signed approval requirement")?;
     check_quorum_minimum(&requirement)?;
+    // Identity extensions before the signer class (DIV §4.3.2), in the reference's order.
+    check_excluded_signers(&requirement, requester)?;
     check_signer_class(&requirement)?;
+    // DIV §5 step 3e, structural half: an offline intent cannot carry requireEnrolledDevice, and an
+    // ordinary one carries it only as `true` without a hardware requirement.
+    check_enrolled_device_structure(&requirement, !offline)?;
     check_requirement_floor(&requirement, expected.requirement.as_ref())?;
     // DIV §5-step-3c. Before Local Payload Reconstruction, so an unsupported payload shape does not
     // surface as a params mismatch.
@@ -1688,8 +2069,9 @@ fn verify_approval_receipt_inner(
         challenged_at = canonical_str_field(&receipt.canonical_payload, "challengedAt")
             .filter(|s| !s.is_empty())
             .ok_or("offline proof is missing challengedAt")?;
-        let challenged = parse_rfc3339_utc_secs(&challenged_at)
-            .ok_or("challengedAt is not a valid RFC3339 UTC timestamp")?;
+        let challenged_ms = parse_rfc3339_utc_ms(&challenged_at)
+            .ok_or("challengedAt is not a valid RFC3339 timestamp")?;
+        let challenged = challenged_ms.div_euclid(1000);
         // An unparseable `expiresAt` must be refused HERE rather than skipping the window cap and
         // relying on the expiry check further down — that check is disabled by `allow_expired`, so
         // the `allow_offline + allow_expired` combination (the documented forensic re-verification
@@ -1705,17 +2087,19 @@ fn verify_approval_receipt_inner(
         // This port was the worst of the three that had the bug: its parser also rejected a valid
         // `+00:00` offset that the TS and Go ports accept, so a proof they would refuse for its
         // window passed here. See `parse_rfc3339_utc_secs`, now fixed to agree with them.
-        let expiry = parse_rfc3339_utc_secs(&expires_at)
+        let expiry_ms = parse_rfc3339_utc_ms(&expires_at)
             .ok_or("expiresAt is not a valid RFC3339 timestamp")?;
-        let window_secs = expiry - challenged;
-        if window_secs < 0 {
-            return Err("offline proof expires before it was challenged".to_string());
-        }
-        if window_secs > MAX_OFFLINE_WINDOW_MINUTES * 60 {
+        // To the millisecond, as the reference computes it: a window a fraction of a second over
+        // the cap is over it.
+        let window_ms = expiry_ms - challenged_ms;
+        if window_ms > MAX_OFFLINE_WINDOW_MINUTES * 60_000 {
             return Err(format!(
-                "offline window is {:.1} minutes, over the {MAX_OFFLINE_WINDOW_MINUTES}-minute maximum",
-                window_secs as f64 / 60.0
+                "offline window is {} minutes, over the {MAX_OFFLINE_WINDOW_MINUTES}-minute maximum",
+                js_to_fixed_1(window_ms as f64 / 60_000.0)
             ));
+        }
+        if window_ms < 0 {
+            return Err("offline proof expires before it was challenged".to_string());
         }
         // The cap above bounds the window's WIDTH; this bounds its POSITION (DIV §5a.3 rule 3).
         // Without it a proof challenged for a date years out, with a compliant 60-minute window,
@@ -1741,28 +2125,22 @@ fn verify_approval_receipt_inner(
     let mut delegated_to: Option<Vec<String>> = None;
     let mut delegated_quorum: Option<u32> = None;
     if let Some(d) = &opts.delegation {
+        if d.tenant_id != tenant_id {
+            return Err("delegation and approval belong to different tenants".into());
+        }
         let expiry = parse_rfc3339_utc_secs(&d.expires_at)
-            .ok_or("delegation expiresAt is not a valid RFC3339 UTC timestamp")?;
+            .ok_or("delegation expiresAt is not a valid RFC3339 timestamp")?;
         if !opts.allow_expired {
             let (now, skew) = evaluation_time(opts);
             if now > expiry + skew {
                 return Err(
-                    "delegation has expired (set allow_expired for audit re-verification)"
+                    "delegation has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)"
                         .to_string(),
                 );
             }
         }
         if d.target != expected.target {
             return Err("the delegation was issued for a different target".to_string());
-        }
-        if d.tenant_id != tenant_id {
-            return Err("the delegation is bound to a different tenant".into());
-        }
-        if requester.did != d.requester_did {
-            return Err(
-                "offline approval was requested by a different principal than the delegation"
-                    .into(),
-            );
         }
         if d.action_type != expected.action_type {
             return Err("the delegation was issued for a different actionType".to_string());
@@ -1843,13 +2221,23 @@ fn verify_approval_receipt_inner(
     // Expiration (DIV §5.8/§6.2). Fail-closed by default; opt out only for audit re-verification.
     if !opts.allow_expired {
         let expiry = parse_rfc3339_utc_secs(&expires_at)
-            .ok_or("expiresAt is not a valid RFC3339 UTC timestamp")?;
+            .ok_or("expiresAt is not a valid RFC3339 timestamp")?;
         let (now, skew) = evaluation_time(opts);
         if now > expiry + skew {
             return Err(
-                "proof has expired (set allow_expired for audit re-verification)".to_string(),
+                "proof has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".to_string(),
             );
         }
+    }
+
+    // Optional: assert WHICH workload the approval was granted to — after the byte comparison and
+    // expiry, as in the reference.
+    if expected
+        .requester_did
+        .as_deref()
+        .is_some_and(|did| requester.did != did)
+    {
+        return Err("approval was requested by a different principal".into());
     }
 
     // A policy AUTO_APPROVED receipt carries NO human signature, so there is nothing to verify
@@ -1868,11 +2256,23 @@ fn verify_approval_receipt_inner(
                 return Err("an offline approval cannot be auto-approved — there is no human signature to verify".to_string());
             }
             if !opts.allow_auto_approved {
-                return Err("AUTO_APPROVED receipts are refused by default".to_string());
+                return Err(AUTO_APPROVED_REFUSED.to_string());
             }
             // No human signed, so there are no signers to report — not an empty quorum that passed.
             return Ok(Vec::new());
         }
+    }
+
+    let witnesses = witnesses_of(receipt);
+    if witnesses.is_empty() {
+        return Err("receipt missing signature material".to_string());
+    }
+    // DoS bound, not a policy limit — see MAX_WITNESSES.
+    if witnesses.len() > MAX_WITNESSES {
+        return Err(format!(
+            "receipt carries {} witnesses, above the {MAX_WITNESSES} this verifier will process",
+            witnesses.len()
+        ));
     }
 
     if requirement.required_approvals > 1
@@ -1885,26 +2285,35 @@ fn verify_approval_receipt_inner(
     if requirement.requester_cannot_approve
         && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
     {
-        return Err("requesterCannotApprove requires a DID-mode trust anchor; in PublicKeys mode signerDid is unverified and four-eyes cannot be enforced".to_string());
+        return Err(KEY_ONLY_FOUR_EYES_REASON.to_string());
     }
-
-    let witnesses = witnesses_of(receipt);
-    if witnesses.is_empty() {
-        return Err("missing signature or public key".to_string());
+    if requirement
+        .excluded_signer_dids
+        .as_ref()
+        .is_some_and(|dids| !dids.is_empty())
+        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
+    {
+        return Err(KEY_ONLY_FOUR_EYES_REASON.into());
     }
-    // DoS bound, not a policy limit — see MAX_WITNESSES.
-    if witnesses.len() > MAX_WITNESSES {
-        return Err(format!(
-            "receipt carries {} witnesses, above the {MAX_WITNESSES} this verifier will process",
-            witnesses.len()
-        ));
-    }
+    // DIV §5 step 3e, list half: decided before counting, like the anchor-shape checks above, so a
+    // caller missing its enrollment records is told so instead of reading a quorum shortfall.
+    let enrolled_devices = if requirement.require_enrolled_device == Some(true) {
+        Some(enrolled_device_fingerprints(expected)?)
+    } else {
+        None
+    };
 
     // Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct
     // is load-bearing: without it, N copies of one approver's signature satisfy an N-of-M quorum.
     let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
         std::collections::HashMap::new();
+    seed_excluded_signing_keys(
+        &mut counted_keys,
+        &expected.approvers,
+        &requirement,
+        requester,
+    )?;
     let mut failures: Vec<String> = Vec::new();
     for witness in &witnesses {
         let candidates = match expected.approvers.candidates_restricted(
@@ -1951,10 +2360,24 @@ fn verify_approval_receipt_inner(
                 continue;
             }
         }
+        // DIV §5 step 7: under requireEnrolledDevice only an ES256 witness under one of the caller's
+        // enrolled device keys counts. The key compared is the TRUSTED one it verified under.
+        if enrolled_devices.as_ref().is_some_and(|devices| {
+            witness.sig_alg.as_deref() == Some("WEBAUTHN")
+                || !devices.contains(&signing_key_identity(&matched_key))
+        }) {
+            failures.push(format!(
+                "signer {} did not sign with an enrolled approver device key, but the signed policy requires one",
+                witness.signer_did.as_deref().unwrap_or("")
+            ));
+            continue;
+        }
         // Four-eyes, verified offline against the requester in the same signed payload.
-        if requirement.requester_cannot_approve
-            && witness.signer_did.as_deref() == Some(&requester.did)
-        {
+        if signer_is_excluded(
+            &requirement,
+            requester,
+            witness.signer_did.as_deref().unwrap_or(""),
+        ) {
             failures.push(format!(
                 "four-eyes: requester {} cannot approve their own action",
                 witness.signer_did.as_deref().unwrap_or("")
@@ -2011,8 +2434,7 @@ pub fn verify_platform_receipt(
     expected: &PlatformReceiptExpectation,
     opts: &VerifyOptions,
 ) -> Result<Vec<String>, String> {
-    let value: Value = serde_json::from_str(&receipt.canonical_payload)
-        .map_err(|_| "canonicalPayload is not valid JSON".to_string())?;
+    let value = payload_probe(&receipt.canonical_payload);
     let tenant_id = check_tenant_binding(&value, expected.tenant_id.as_deref())?;
     match value.get("type").and_then(Value::as_str) {
         Some(DIV_PLATFORM_INTENT_TYPE) => {}
@@ -2025,7 +2447,7 @@ pub fn verify_platform_receipt(
         _ => return Err("payload is not a div-platform-intent".into()),
     }
     if expected.nonce.is_empty() {
-        return Err("expected.nonce is required".into());
+        return Err(EXPECTED_NONCE_REQUIRED_REASON.into());
     }
     if value.get("nonce").and_then(Value::as_str) != Some(expected.nonce.as_str()) {
         return Err("receipt is for a different challenge".into());
@@ -2039,28 +2461,26 @@ pub fn verify_platform_receipt(
         return Err("expected.payload_hash must be the 64-character lowercase hex SHA-256 you recomputed yourself".into());
     }
     if expected.rp_id.is_empty() {
-        return Err("expected.rp_id is required".into());
+        return Err("expected.rp_id is required — it must be YOUR registered RP ID, asserted independently of the receipt".into());
     }
     if let Some(rp) = &opts.expected_rp_id {
         if rp != &expected.rp_id {
-            return Err("opts.expected_rp_id conflicts with expected.rp_id".into());
+            return Err(
+                "opts.expected_rp_id conflicts with expected.rp_id — pass the RP ID once".into(),
+            );
         }
     }
-    if opts
-        .expected_origin
-        .as_deref()
-        .unwrap_or_default()
-        .is_empty()
-    {
-        return Err("expected_origin is required for a WebAuthn platform receipt".into());
-    }
+    // No early origin check: as in the reference, a missing expected_origin refuses each WebAuthn
+    // witness (folded into "no valid subject signature (...)").
     let signed_at = value
         .get("signedAt")
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .ok_or("receipt missing signedAt")?;
     let expires_at = value
         .get("expiresAt")
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .ok_or("receipt missing expiresAt")?;
     let subject = value
         .get("subject")
@@ -2099,10 +2519,12 @@ pub fn verify_platform_receipt(
         return Err("receipt is signed in the future (DIV §5c.3)".into());
     }
     if !opts.allow_expired && now > expiry + skew {
-        return Err("proof has expired (set allow_expired for audit re-verification)".into());
+        return Err("proof has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".into());
     }
     if receipt.sig_alg.as_deref() == Some("AUTO_APPROVED") {
-        return Err("a platform receipt cannot be auto-approved".into());
+        return Err(
+            "a platform receipt cannot be auto-approved — there is no signature to verify".into(),
+        );
     }
     let normalized = platform_as_approval(receipt);
     let witnesses = witnesses_of(&normalized);
@@ -2143,10 +2565,16 @@ pub fn verify_platform_receipt(
             }
         };
         let mut matched = None;
+        // The last candidate's own failure is what is reported, as in the reference.
+        let mut last_reason =
+            "signature does not verify against any trusted subject key".to_string();
         for (key, identity) in candidates {
-            if verify_witness(&witness, &key, &normalized, &effective).is_ok() {
-                matched = Some((identity, key));
-                break;
+            match verify_witness(&witness, &key, &normalized, &effective) {
+                Ok(()) => {
+                    matched = Some((identity, key));
+                    break;
+                }
+                Err(why) => last_reason = why,
             }
         }
         if let Some((identity, matched_key)) = matched {
@@ -2157,7 +2585,7 @@ pub fn verify_platform_receipt(
                 }
             }
         } else {
-            failures.push("signature does not verify against any trusted subject key".into());
+            failures.push(last_reason);
         }
     }
     if verified.is_empty() {
@@ -2196,12 +2624,27 @@ pub fn verify_agent_authority(
     expected: &AgentAuthorityExpectation,
     opts: &VerifyOptions,
 ) -> Result<VerifiedAgentAuthority, String> {
-    let value: Value = serde_json::from_str(&receipt.canonical_payload)
-        .map_err(|_| "canonicalPayload is not valid JSON")?;
+    let value = payload_probe(&receipt.canonical_payload);
     let tenant_id = check_tenant_binding(&value, expected.tenant_id.as_deref())?;
     if value.get("type").and_then(Value::as_str) != Some(DIV_AGENT_AUTHORITY_TYPE) {
         return Err("payload is not a div-agent-authority".into());
     }
+    // A present `null` (a root authority) or a sha256 digest; anything else, an absent field
+    // included, is refused before the patterns — the reference's order and text.
+    let parent_receipt_hash = match value.get("parentReceiptHash") {
+        Some(Value::Null) => None,
+        Some(Value::String(digest))
+            if digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            }) =>
+        {
+            Some(digest.clone())
+        }
+        _ => return Err("authority is missing a valid parent receipt commitment".into()),
+    };
     let raw_patterns = value
         .get("actionPatterns")
         .and_then(Value::as_array)
@@ -2215,27 +2658,6 @@ pub fn verify_agent_authority(
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
-    let parent_value = value
-        .get("parentReceiptHash")
-        .ok_or("authority is missing parentReceiptHash")?;
-    let parent_receipt_hash = if parent_value.is_null() {
-        None
-    } else {
-        let digest = parent_value
-            .as_str()
-            .ok_or("authority has invalid parentReceiptHash")?;
-        let hex = digest
-            .strip_prefix("sha256:")
-            .ok_or("authority has invalid parentReceiptHash")?;
-        if hex.len() != 64
-            || !hex
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
-            return Err("authority has invalid parentReceiptHash".into());
-        }
-        Some(digest.to_string())
-    };
     let sealed_at = value
         .get("sealedAt")
         .and_then(Value::as_str)
@@ -2257,12 +2679,6 @@ pub fn verify_agent_authority(
     if sealed > now + skew {
         return Err("authority is sealed in the future (DIV §5b.2)".into());
     }
-    if expected.target.is_empty() {
-        return Err("expected.target is required".into());
-    }
-    if expected.agent_did.is_empty() {
-        return Err("expected.agent_did is required".into());
-    }
     let requester = receipt
         .requester
         .as_ref()
@@ -2275,19 +2691,20 @@ pub fn verify_agent_authority(
     )
     .map_err(|_| "authority payload is missing the signed approval requirement")?;
     check_quorum_minimum(&requirement)?;
+    // Identity extensions before the signer class (DIV §4.3.2), in the reference's order.
+    check_excluded_signers(&requirement, requester)?;
     check_signer_class(&requirement)?;
+    // DIV §5 step 3e: this payload kind can never carry requireEnrolledDevice.
+    check_enrolled_device_structure(&requirement, false)?;
     check_requirement_floor(&requirement, expected.requirement.as_ref())?;
-    if requirement.required_approvals > 1
-        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
-    {
-        return Err(
-            "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)".into(),
-        );
+    if expected.target.is_empty() {
+        return Err("expected.target is required — it must be YOUR target identifier, asserted independently of the authority (DIV Target Isolation)".into());
     }
-    if requirement.requester_cannot_approve
-        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
-    {
-        return Err("requesterCannotApprove requires a DID-mode trust anchor; in PublicKeys mode signerDid is unverified and four-eyes cannot be enforced".into());
+    if expected.agent_did.is_empty() {
+        return Err(
+            "expected.agent_did is required — name the agent whose authority you are checking"
+                .into(),
+        );
     }
     let nonce = value
         .get("nonce")
@@ -2310,10 +2727,10 @@ pub fn verify_agent_authority(
         return Err("target/agent/actionPatterns do not match what was sealed".into());
     }
     if !opts.allow_expired && now > expiry + skew {
-        return Err("authority has expired (set allow_expired for audit re-verification)".into());
+        return Err("authority has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".into());
     }
     if receipt.sig_alg.as_deref() == Some("AUTO_APPROVED") {
-        return Err("an agent authority cannot be auto-approved".into());
+        return Err("an agent authority cannot be auto-approved — granting agent scope requires human signatures".into());
     }
     let witnesses = witnesses_of(receipt);
     if witnesses.is_empty() {
@@ -2325,9 +2742,35 @@ pub fn verify_agent_authority(
             witnesses.len()
         ));
     }
+    if requirement.required_approvals > 1
+        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
+    {
+        return Err(
+            "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)".into(),
+        );
+    }
+    if requirement.requester_cannot_approve
+        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
+    {
+        return Err(KEY_ONLY_FOUR_EYES_REASON.into());
+    }
+    if requirement
+        .excluded_signer_dids
+        .as_ref()
+        .is_some_and(|dids| !dids.is_empty())
+        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
+    {
+        return Err(KEY_ONLY_FOUR_EYES_REASON.into());
+    }
     let mut verified = std::collections::BTreeSet::new();
     let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
         std::collections::HashMap::new();
+    seed_excluded_signing_keys(
+        &mut counted_keys,
+        &expected.approvers,
+        &requirement,
+        requester,
+    )?;
     let mut failures = Vec::new();
     for witness in witnesses {
         let candidates = match expected.approvers.candidates(
@@ -2341,14 +2784,18 @@ pub fn verify_agent_authority(
             }
         };
         let mut matched = None;
+        let mut last = "signature does not verify against any trusted approver key".to_string();
         for (key, identity) in candidates {
-            if verify_witness(&witness, &key, receipt, opts).is_ok() {
-                matched = Some((identity, key));
-                break;
+            match verify_witness(&witness, &key, receipt, opts) {
+                Ok(()) => {
+                    matched = Some((identity, key));
+                    break;
+                }
+                Err(why) => last = why,
             }
         }
         let Some((identity, matched_key)) = matched else {
-            failures.push("signature does not verify against any trusted approver key".into());
+            failures.push(last);
             continue;
         };
         if requirement.requires_hardware_credential()
@@ -2363,9 +2810,11 @@ pub fn verify_agent_authority(
                 continue;
             }
         }
-        if requirement.requester_cannot_approve
-            && witness.signer_did.as_deref() == Some(&requester.did)
-        {
+        if signer_is_excluded(
+            &requirement,
+            requester,
+            witness.signer_did.as_deref().unwrap_or(""),
+        ) {
             failures.push(format!(
                 "four-eyes: requester {} cannot seal their own request",
                 witness.signer_did.as_deref().unwrap_or("")
@@ -2542,11 +2991,7 @@ pub fn verify_delegation(
     expected: &Expected,
     opts: &VerifyOptions,
 ) -> Result<VerifiedDelegation, String> {
-    if receipt.canonical_payload.is_empty() {
-        return Err("missing canonicalPayload".to_string());
-    }
-    let probe: Value = serde_json::from_str(&receipt.canonical_payload)
-        .map_err(|_| "canonicalPayload is not valid JSON".to_string())?;
+    let probe = payload_probe(&receipt.canonical_payload);
     let tenant_id = check_tenant_binding(&probe, expected.tenant_id.as_deref())?;
     if probe.get("type").and_then(Value::as_str) != Some(DIV_DELEGATION_TYPE) {
         return Err("payload is not a div-delegation".to_string());
@@ -2557,28 +3002,28 @@ pub fn verify_delegation(
     // The sealing quorum names PEOPLE; in PublicKeys mode it would count credentials instead.
     if matches!(expected.approvers, ApproverTrustAnchor::PublicKeys(_)) {
         return Err(
-            "a delegation requires a DID-mode trust anchor; a key-set anchor cannot associate identities (DIV §4.4.6)"
+            "a delegation requires a DID-mode trust anchor (ApproverTrustAnchor::DidsMultiKey { dids, resolve }); a key-set anchor cannot associate identities (DIV §4.4.6)"
                 .to_string(),
         );
     }
 
+    // An array of non-empty strings, as in the reference; an empty array is well-formed and is
+    // refused by the size check below.
     let delegated_to: Vec<String> = probe
         .get("delegatedTo")
         .and_then(Value::as_array)
-        .map(|a| {
+        .and_then(|a| {
             a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
+                .map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+                .collect::<Option<Vec<String>>>()
         })
-        .unwrap_or_default();
-    if delegated_to.is_empty() {
-        return Err("delegation is missing a valid delegatedTo set".to_string());
-    }
-    let delegated_quorum = probe
+        .ok_or("delegation is missing a valid delegatedTo set")?;
+    // `Number.isInteger(q) && q >= 1`: an integral JSON number in either spelling (2 or 2.0).
+    let quorum = probe
         .get("delegatedQuorum")
-        .and_then(Value::as_i64)
-        .filter(|q| *q >= 1)
-        .ok_or("delegation is missing a valid delegatedQuorum")? as u32;
+        .and_then(Value::as_f64)
+        .filter(|q| q.fract() == 0.0 && *q >= 1.0)
+        .ok_or("delegation is missing a valid delegatedQuorum")?;
 
     // Deduplicate before the size check: a delegatedTo listing one operator three times would otherwise
     // appear to support a 3-of-3 quorum that one person could satisfy alone.
@@ -2588,12 +3033,14 @@ pub fn verify_delegation(
             distinct.push(d.clone());
         }
     }
-    if (distinct.len() as u32) < delegated_quorum {
+    if (distinct.len() as f64) < quorum {
         return Err(format!(
-            "delegation names {} distinct operator(s) but delegates a quorum of {delegated_quorum} — it can never be satisfied",
-            distinct.len()
+            "delegation names {} distinct operator(s) but delegates a quorum of {} — it can never be satisfied",
+            distinct.len(),
+            js_number_text(&probe["delegatedQuorum"])
         ));
     }
+    let delegated_quorum = quorum as u32;
 
     let sealed_at = canonical_str_field(&receipt.canonical_payload, "sealedAt")
         .filter(|s| !s.is_empty())
@@ -2601,18 +3048,19 @@ pub fn verify_delegation(
     let expires_at = canonical_str_field(&receipt.canonical_payload, "expiresAt")
         .filter(|s| !s.is_empty())
         .ok_or("delegation is missing expiresAt")?;
-    let sealed = parse_rfc3339_utc_secs(&sealed_at)
-        .ok_or("sealedAt is not a valid RFC3339 UTC timestamp")?;
-    let expiry = parse_rfc3339_utc_secs(&expires_at)
-        .ok_or("expiresAt is not a valid RFC3339 UTC timestamp")?;
-    let window_secs = expiry - sealed;
-    if window_secs < 0 {
+    let sealed_ms =
+        parse_rfc3339_utc_ms(&sealed_at).ok_or("sealedAt is not a valid RFC3339 timestamp")?;
+    let expiry_ms =
+        parse_rfc3339_utc_ms(&expires_at).ok_or("expiresAt is not a valid RFC3339 timestamp")?;
+    let (sealed, expiry) = (sealed_ms.div_euclid(1000), expiry_ms.div_euclid(1000));
+    let window_ms = expiry_ms - sealed_ms;
+    if window_ms < 0 {
         return Err("delegation expires before it was sealed".to_string());
     }
-    if window_secs > MAX_DELEGATION_WINDOW_HOURS * 3600 {
+    if window_ms > MAX_DELEGATION_WINDOW_HOURS * 3_600_000 {
         return Err(format!(
-            "delegation window is {:.1} hours, over the {MAX_DELEGATION_WINDOW_HOURS}-hour maximum",
-            window_secs as f64 / 3600.0
+            "delegation window is {} hours, over the {MAX_DELEGATION_WINDOW_HOURS}-hour maximum",
+            js_to_fixed_1(window_ms as f64 / 3_600_000.0)
         ));
     }
     // Position, not just width (DIV §5a.6 step 1, mirroring §5a.3 rule 3). A forward-dated
@@ -2640,7 +3088,11 @@ pub fn verify_delegation(
         .and_then(|v| serde_json::from_value(v).ok())
         .ok_or("delegation payload is missing the signed approval requirement")?;
     check_quorum_minimum(&requirement)?;
+    // Identity extensions before the signer class (DIV §4.3.2), in the reference's order.
+    check_excluded_signers(&requirement, requester)?;
     check_signer_class(&requirement)?;
+    // DIV §5 step 3e: this payload kind can never carry requireEnrolledDevice.
+    check_enrolled_device_structure(&requirement, false)?;
     check_requirement_floor(&requirement, expected.requirement.as_ref())?;
     if expected.target.is_empty() {
         return Err("expected.target is required — it must be YOUR target identifier, asserted independently of the delegation (DIV Target Isolation)".to_string());
@@ -2673,7 +3125,7 @@ pub fn verify_delegation(
 
     if !opts.allow_expired && now > expiry + skew {
         return Err(
-            "delegation has expired (set allow_expired for audit re-verification)".to_string(),
+            "delegation has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".to_string(),
         );
     }
     if receipt.sig_alg.as_deref() == Some("AUTO_APPROVED") {
@@ -2692,9 +3144,23 @@ pub fn verify_delegation(
             witnesses.len()
         ));
     }
+    if requirement
+        .excluded_signer_dids
+        .as_ref()
+        .is_some_and(|dids| !dids.is_empty())
+        && matches!(&expected.approvers, ApproverTrustAnchor::PublicKeys(_))
+    {
+        return Err(KEY_ONLY_FOUR_EYES_REASON.into());
+    }
     let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut counted_keys: std::collections::HashMap<Vec<u8>, String> =
         std::collections::HashMap::new();
+    seed_excluded_signing_keys(
+        &mut counted_keys,
+        &expected.approvers,
+        &requirement,
+        requester,
+    )?;
     let mut failures: Vec<String> = Vec::new();
     for witness in &witnesses {
         let candidates = match expected.approvers.candidates(
@@ -2737,9 +3203,11 @@ pub fn verify_delegation(
                 continue;
             }
         }
-        if requirement.requester_cannot_approve
-            && witness.signer_did.as_deref() == Some(&requester.did)
-        {
+        if signer_is_excluded(
+            &requirement,
+            requester,
+            witness.signer_did.as_deref().unwrap_or(""),
+        ) {
             failures.push(format!(
                 "four-eyes: requester {} cannot delegate to themselves",
                 witness.signer_did.as_deref().unwrap_or("")
@@ -2788,19 +3256,7 @@ fn shared_key_problem(
     key: &str,
     identity: &str,
 ) -> Option<String> {
-    let decoded = webauthn::decode_base64_flexible(key);
-    let fingerprint = decoded.as_ref().map_or_else(
-        |_| key.as_bytes().to_vec(),
-        |bytes| {
-            if bytes.first() == Some(&0x30) {
-                parse_p256_public_key(bytes)
-                    .map(|key| key.to_encoded_point(false).as_bytes().to_vec())
-                    .unwrap_or_else(|| bytes.clone())
-            } else {
-                webauthn::cose_p256_fingerprint(bytes).unwrap_or_else(|_| bytes.clone())
-            }
-        },
-    );
+    let fingerprint = signing_key_identity(key);
     if let Some(owner) = counted.get(&fingerprint) {
         if owner != identity {
             return Some(format!(
@@ -2811,6 +3267,86 @@ fn shared_key_problem(
     }
     counted.insert(fingerprint, identity.to_string());
     None
+}
+
+/// The fingerprint [`shared_key_problem`] compares keys by.
+fn signing_key_identity(key: &str) -> Vec<u8> {
+    let decoded = webauthn::decode_base64_flexible(key);
+    decoded.as_ref().map_or_else(
+        |_| key.as_bytes().to_vec(),
+        |bytes| {
+            if bytes.first() == Some(&0x30) {
+                parse_p256_public_key(bytes)
+                    .map(|key| key.to_encoded_point(false).as_bytes().to_vec())
+                    .unwrap_or_else(|| bytes.clone())
+            } else {
+                webauthn::cose_p256_fingerprint(bytes).unwrap_or_else(|_| bytes.clone())
+            }
+        },
+    )
+}
+
+/// Identities the signed policy bars from approving: `excludedSignerDids`, plus the requester and
+/// its credential issuer under `requesterCannotApprove`.
+fn excluded_identity_dids(
+    requirement: &ApprovalRequirement,
+    requester: &RequesterIdentity,
+) -> std::collections::BTreeSet<String> {
+    let mut dids: std::collections::BTreeSet<String> = requirement
+        .excluded_signer_dids
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    if requirement.requester_cannot_approve {
+        dids.insert(requester.did.clone());
+        if let Some(issuer) = requester.credential_issuer_did.as_deref() {
+            if !issuer.is_empty() {
+                dids.insert(issuer.to_string());
+            }
+        }
+    }
+    dids
+}
+
+/// Pre-register every key the anchor's resolver binds to an excluded identity, so an eligible DID
+/// that signs under one of those keys is refused as a shared key (DIV §4.4.6). Eligibility remains
+/// the anchor's DID list; the resolver may retain trusted keys for excluded identities.
+///
+/// A resolver that panics for an excluded identity refuses the receipt, as in the reference: a
+/// lookup outage must not drop that identity's keys from the one-key-one-person check, or an
+/// eligible alias could sign under one of them. Returning `None`/no keys is not a failure.
+fn seed_excluded_signing_keys(
+    counted: &mut std::collections::HashMap<Vec<u8>, String>,
+    anchor: &ApproverTrustAnchor,
+    requirement: &ApprovalRequirement,
+    requester: &RequesterIdentity,
+) -> Result<(), String> {
+    for did in excluded_identity_dids(requirement, requester) {
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match anchor {
+            ApproverTrustAnchor::PublicKeys(_) => None,
+            ApproverTrustAnchor::Dids { resolve, .. } => {
+                Some(resolve(&did).into_iter().collect::<Vec<String>>())
+            }
+            ApproverTrustAnchor::DidsMultiKey { resolve, .. } => Some(resolve(&did)),
+        }));
+        let keys = match resolved {
+            Ok(Some(keys)) => keys,
+            Ok(None) => return Ok(()),
+            Err(_) => {
+                return Err(format!(
+                    "could not resolve keys for excluded identity {did}; refusing rather than ignoring its keys (DIV §4.4.6)"
+                ))
+            }
+        };
+        for key in keys {
+            counted.insert(
+                signing_key_identity(&key),
+                format!("excluded identity {did}"),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn witnesses_of(receipt: &ApprovalReceipt) -> Vec<ApprovalWitness> {
@@ -2841,26 +3377,28 @@ fn verify_witness(
 ) -> Result<(), String> {
     match witness.sig_alg.as_deref() {
         Some("WEBAUTHN") => {
-            return webauthn::verify_webauthn_witness(witness, trusted_key, receipt, opts)
+            return webauthn::verify_receipt_witness(witness, trusted_key, receipt, opts)
         }
         Some("AUTO_APPROVED") => return Err("unsupported witness signature algorithm".into()),
         // DIV §4.4.2 requires ES256 compatibility for absent and unknown labels.
         _ => {}
     }
-    // ES256: the human's key signed the canonical payload bytes directly.
-    let pub_bytes = STANDARD
-        .decode(trusted_key)
-        .map_err(|_| "invalid trusted key base64".to_string())?;
-    let sig_bytes = STANDARD
-        .decode(&witness.signature)
-        .map_err(|_| "invalid signature base64".to_string())?;
-    let verifying_key = parse_p256_public_key(&pub_bytes)
-        .ok_or_else(|| "failed to parse trusted approver key".to_string())?;
-    if verify_p256_signature(
-        &verifying_key,
-        receipt.canonical_payload.as_bytes(),
-        &sig_bytes,
-    ) {
+    // ES256: the human's key signed the canonical payload bytes directly. Every failure — an
+    // undecodable key or signature included — is the one reference reason.
+    let verified = (|| {
+        let pub_bytes = STANDARD.decode(trusted_key).ok()?;
+        let sig_bytes = STANDARD.decode(&witness.signature).ok()?;
+        // SPKI DER only, as the reference reads an ES256 trusted key; a raw SEC1 point is refused.
+        let verifying_key = PublicKey::from_public_key_der(&pub_bytes)
+            .map(|pk| VerifyingKey::from(&pk))
+            .ok()?;
+        Some(verify_p256_signature(
+            &verifying_key,
+            receipt.canonical_payload.as_bytes(),
+            &sig_bytes,
+        ))
+    })();
+    if verified == Some(true) {
         Ok(())
     } else {
         Err("signature does not verify against the trusted signer key".to_string())
@@ -2912,6 +3450,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:deploy-pipeline".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let params = json!({ "environment": "staging" });
         // Far-future expiry so the fail-closed expiry check (DIV §5.8) passes without being
@@ -2957,6 +3496,7 @@ mod tests {
             requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![STANDARD.encode(spki.as_bytes())]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         (receipt, expected)
     }
@@ -2975,6 +3515,266 @@ mod tests {
         );
     }
 
+    /// DIV §4.3.2: present-but-null is malformed, not absent. serde alone reads both as `None`.
+    #[test]
+    fn test_present_null_identity_extensions_bind_as_malformed() {
+        let null_issuer: RequesterIdentity = serde_json::from_str(
+            r#"{"did":"did:r","attestation":null,"credentialIssuerDid":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null_issuer.credential_issuer_did.as_deref(), Some(""));
+        let absent: RequesterIdentity =
+            serde_json::from_str(r#"{"did":"did:r","attestation":null}"#).unwrap();
+        assert_eq!(absent.credential_issuer_did, None);
+        let base = r#"{"requiredApprovals":1,"requireHardwareKey":false,"allowedAaguids":[],"requesterCannotApprove":false,"signerClass":"human""#;
+        let null_exclusions: ApprovalRequirement =
+            serde_json::from_str(&format!(r#"{base},"excludedSignerDids":null}}"#)).unwrap();
+        assert_eq!(
+            null_exclusions.excluded_signer_dids,
+            Some(vec![String::new()])
+        );
+        let absent: ApprovalRequirement = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert_eq!(absent.excluded_signer_dids, None);
+        let listed: ApprovalRequirement =
+            serde_json::from_str(&format!(r#"{base},"excludedSignerDids":["did:a"]}}"#)).unwrap();
+        assert_eq!(listed.excluded_signer_dids, Some(vec!["did:a".to_string()]));
+    }
+
+    /// The builders refuse malformed identity extensions, as the reference (`NonCanonicalValue`),
+    /// Go and Python do: no signable bytes for a shape every verifier refuses.
+    #[test]
+    fn test_builders_refuse_malformed_identity_extensions() {
+        let requirement = ApprovalRequirement {
+            required_approvals: 1,
+            require_hardware_key: false,
+            allowed_aaguids: vec![],
+            requester_cannot_approve: false,
+            signer_class: "human".into(),
+            excluded_signer_dids: None,
+            require_enrolled_device: None,
+        };
+        for bad in ["", "did:", "not-a-did", "did:with space"] {
+            let requester = RequesterIdentity {
+                did: "did:r".into(),
+                attestation: None,
+                credential_issuer_did: Some(bad.into()),
+            };
+            let err = canonical_intent_payload(
+                "t",
+                "a",
+                "d",
+                &serde_json::json!({}),
+                &requester,
+                &requirement,
+                "n",
+                "2027-01-01T00:00:00.000Z",
+            )
+            .expect_err("malformed issuer");
+            assert_eq!(err, "credentialIssuerDid must be a valid DID");
+            let excluded = ApprovalRequirement {
+                excluded_signer_dids: Some(vec!["did:a".into(), bad.into()]),
+                ..requirement.clone()
+            };
+            let plain = RequesterIdentity {
+                credential_issuer_did: None,
+                ..requester.clone()
+            };
+            let err = canonical_offline_intent_payload_with_tenant(
+                "t",
+                "a",
+                "d",
+                &serde_json::json!({}),
+                &plain,
+                &excluded,
+                "n",
+                "2026-01-01T00:00:00.000Z",
+                "2027-01-01T00:00:00.000Z",
+                None,
+            )
+            .expect_err("malformed exclusions");
+            assert_eq!(err, "excludedSignerDids must be a DID array");
+        }
+    }
+
+    /// DIV §4.3.2 "Enrolled approver devices": a present `requireEnrolledDevice` is `true` or
+    /// malformed. `false`, `null` and any non-boolean all bind as `Some(false)`, which the verifiers
+    /// refuse with the reference's reason rather than dropping or failing the whole parse.
+    #[test]
+    fn test_require_enrolled_device_binds_present_values() {
+        let base = r#"{"requiredApprovals":1,"requireHardwareKey":false,"allowedAaguids":[],"requesterCannotApprove":false,"signerClass":"human""#;
+        let parse = |tail: &str| -> ApprovalRequirement {
+            serde_json::from_str(&format!("{base}{tail}}}")).unwrap()
+        };
+        assert_eq!(parse("").require_enrolled_device, None);
+        assert_eq!(
+            parse(r#","requireEnrolledDevice":true"#).require_enrolled_device,
+            Some(true)
+        );
+        for malformed in ["false", "null", r#""yes""#, "1", "[true]"] {
+            let requirement = parse(&format!(r#","requireEnrolledDevice":{malformed}"#));
+            assert_eq!(
+                requirement.require_enrolled_device,
+                Some(false),
+                "{malformed}"
+            );
+            assert_eq!(
+                check_enrolled_device_structure(&requirement, true),
+                Err(ENROLLED_DEVICE_MALFORMED_REASON.to_string()),
+                "{malformed}"
+            );
+        }
+        let required = parse(r#","requireEnrolledDevice":true"#);
+        assert_eq!(check_enrolled_device_structure(&required, true), Ok(()));
+        assert_eq!(
+            check_enrolled_device_structure(&required, false),
+            Err(ENROLLED_DEVICE_ORDINARY_ONLY_REASON.to_string())
+        );
+    }
+
+    /// The builders emit `requireEnrolledDevice` only as `true`, only on the ordinary intent kind,
+    /// and never with a hardware requirement — the reference's `enrolledDeviceField`.
+    #[test]
+    fn test_builders_gate_require_enrolled_device() {
+        let requester = RequesterIdentity {
+            did: "did:r".into(),
+            attestation: None,
+            credential_issuer_did: None,
+        };
+        let base = ApprovalRequirement {
+            required_approvals: 1,
+            require_hardware_key: false,
+            allowed_aaguids: vec![],
+            requester_cannot_approve: false,
+            signer_class: "human".into(),
+            excluded_signer_dids: None,
+            require_enrolled_device: None,
+        };
+        let intent = |requirement: &ApprovalRequirement| {
+            canonical_intent_payload_with_tenant(
+                "t",
+                "a",
+                "d",
+                &serde_json::json!({}),
+                &requester,
+                requirement,
+                "n",
+                "2027-01-01T00:00:00.000Z",
+                None,
+            )
+        };
+        let with = |value: Option<bool>| ApprovalRequirement {
+            require_enrolled_device: value,
+            ..base.clone()
+        };
+        let absent = intent(&base).unwrap();
+        // `false` is never emitted: one policy, one encoding.
+        assert_eq!(intent(&with(Some(false))).unwrap(), absent);
+        assert!(!absent.contains("requireEnrolledDevice"));
+        assert!(intent(&with(Some(true)))
+            .unwrap()
+            .contains(r#""requireEnrolledDevice":true,"requireHardwareKey":false"#));
+        for hardware in [
+            ApprovalRequirement {
+                require_hardware_key: true,
+                ..with(Some(true))
+            },
+            ApprovalRequirement {
+                allowed_aaguids: vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
+                ..with(Some(true))
+            },
+        ] {
+            assert_eq!(
+                intent(&hardware),
+                Err(ENROLLED_DEVICE_WITH_HARDWARE_REASON.to_string())
+            );
+        }
+        let device = with(Some(true));
+        let params = serde_json::json!({});
+        let ordinary_only = Err(ENROLLED_DEVICE_ORDINARY_ONLY_REASON.to_string());
+        assert_eq!(
+            canonical_offline_intent_payload_with_tenant(
+                "t",
+                "a",
+                "d",
+                &params,
+                &requester,
+                &device,
+                "n",
+                "2026-01-01T00:00:00.000Z",
+                "2027-01-01T00:00:00.000Z",
+                None,
+            ),
+            ordinary_only
+        );
+        assert_eq!(
+            canonical_delegation_payload_with_tenant(
+                "t",
+                "a",
+                "d",
+                &params,
+                &requester,
+                &device,
+                &["did:a".to_string()],
+                1,
+                "n",
+                "2026-01-01T00:00:00.000Z",
+                "2027-01-01T00:00:00.000Z",
+                None,
+            ),
+            ordinary_only
+        );
+        assert_eq!(
+            canonical_agent_authority_payload_with_parent_and_tenant(
+                "t",
+                &["deploy".to_string()],
+                "d",
+                "did:intyga:agent:a",
+                &requester,
+                &device,
+                "n",
+                "2026-01-01T00:00:00.000Z",
+                "2027-01-01T00:00:00.000Z",
+                None,
+                None,
+            ),
+            ordinary_only
+        );
+        // The agent intent is a `div-intent-verification` too, so it carries the field.
+        assert!(canonical_agent_intent_payload(
+            "t",
+            "a",
+            "d",
+            &params,
+            &requester,
+            &device,
+            "n",
+            "2027-01-01T00:00:00.000Z",
+            &serde_json::json!({}),
+        )
+        .unwrap()
+        .contains(r#""requireEnrolledDevice":true"#));
+    }
+
+    /// The step-3e list half follows the reference's order: absent, malformed entry, empty.
+    #[test]
+    fn test_enrolled_device_key_list_order() {
+        let (_, mut expected) = signed_receipt();
+        assert_eq!(
+            enrolled_device_fingerprints(&expected),
+            Err(ENROLLED_DEVICE_KEYS_REQUIRED_REASON.to_string())
+        );
+        expected.enrolled_device_keys = Some(Vec::new());
+        assert_eq!(
+            enrolled_device_fingerprints(&expected),
+            Err(ENROLLED_DEVICE_KEYS_REQUIRED_REASON.to_string())
+        );
+        expected.enrolled_device_keys = Some(vec![String::new()]);
+        assert_eq!(
+            enrolled_device_fingerprints(&expected),
+            Err(ENROLLED_DEVICE_KEYS_MALFORMED_REASON.to_string())
+        );
+    }
+
     /// DIV §5 step 3d (H1). The fixture's signed requirement is 1-of-1 with no four-eyes rule — the
     /// shape a single approver who is also the requester can compose alone. Without a floor it
     /// verifies (legacy behaviour, pinned); under the relying party's own stricter rule it is refused
@@ -2988,19 +3788,25 @@ mod tests {
                 required_approvals: 3,
                 requester_cannot_approve: true,
                 require_hardware_key: false,
+                excluded_signer_dids: None,
+                require_enrolled_device: false,
             },
             RequirementFloor {
                 required_approvals: 1,
                 requester_cannot_approve: true,
                 require_hardware_key: false,
+                excluded_signer_dids: None,
+                require_enrolled_device: false,
             },
             RequirementFloor {
                 required_approvals: 1,
                 requester_cannot_approve: false,
                 require_hardware_key: true,
+                excluded_signer_dids: None,
+                require_enrolled_device: false,
             },
         ] {
-            expected.requirement = Some(floor);
+            expected.requirement = Some(floor.clone());
             let err = verify_approval_receipt(&receipt, &expected)
                 .expect_err("a weaker signed requirement must be refused");
             assert!(err.contains(WEAKER_REQUIREMENT_REASON), "{floor:?}: {err}");
@@ -3016,6 +3822,42 @@ mod tests {
             ..Default::default()
         });
         assert!(verify_approval_receipt(&receipt, &expected).is_ok());
+        expected.requirement = Some(RequirementFloor {
+            required_approvals: 1,
+            excluded_signer_dids: Some(Vec::new()),
+            ..Default::default()
+        });
+        let err = verify_approval_receipt(&receipt, &expected)
+            .expect_err("an explicitly present exclusion floor requires a signed field");
+        assert!(err.contains(WEAKER_REQUIREMENT_REASON), "{err}");
+        // A malformed floor DID fails closed as malformed, before any comparison (the reference's
+        // validSignerExclusions); duplicates are covered by the set check, not refused.
+        for bad in ["", "did:", "not-a-did", "did:ex:with space"] {
+            expected.requirement = Some(RequirementFloor {
+                required_approvals: 9,
+                excluded_signer_dids: Some(vec![bad.to_string()]),
+                ..Default::default()
+            });
+            let err =
+                verify_approval_receipt(&receipt, &expected).expect_err("malformed floor DID");
+            assert!(err.contains("malformed"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_requirement_floor_accepts_duplicate_excluded_dids() {
+        let signed = ApprovalRequirement {
+            required_approvals: 1,
+            signer_class: "human".into(),
+            excluded_signer_dids: Some(vec!["did:ex:a".into()]),
+            ..Default::default()
+        };
+        let floor = RequirementFloor {
+            required_approvals: 1,
+            excluded_signer_dids: Some(vec!["did:ex:a".into(), "did:ex:a".into()]),
+            ..Default::default()
+        };
+        assert_eq!(check_requirement_floor(&signed, Some(&floor)), Ok(()));
     }
 
     /// The same floor binds a delegation's SEALING requirement to the ordinary rule (DIV §5a.5).
@@ -3065,6 +3907,7 @@ mod tests {
             let requester = RequesterIdentity {
                 did: "did:intyga:service:deploy-pipeline".to_string(),
                 attestation: None,
+                credential_issuer_did: None,
             };
             let params = json!({ "environment": "staging" });
             let requirement = ApprovalRequirement {
@@ -3128,6 +3971,7 @@ mod tests {
             requester_did: None,
             approvers: base.approvers,
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         assert_eq!(
             verify_approval_receipt(&receipt, &expected),
@@ -3141,7 +3985,7 @@ mod tests {
         receipt.sig_alg = Some("AUTO_APPROVED".to_string());
         assert_eq!(
             verify_approval_receipt(&receipt, &expected),
-            Err("AUTO_APPROVED receipts are refused by default".to_string())
+            Err(AUTO_APPROVED_REFUSED.to_string())
         );
     }
 
@@ -3188,6 +4032,7 @@ mod tests {
                     .clone()
                     .unwrap_or_default()]),
                 tenant_id: None,
+                enrolled_device_keys: None,
             };
 
             let result = verify_approval_receipt(&receipt, &expected);
@@ -3202,7 +4047,10 @@ mod tests {
             // A DEWP §4.7 statement must be refused for being one, not for a later step.
             if name == "execution-evidence-refused-by-approval-verifier" {
                 let err = result.clone().expect_err("must be refused");
-                assert!(err.contains("execution-evidence statement"), "{name}: {err}");
+                assert!(
+                    err.contains("execution-evidence statement"),
+                    "{name}: {err}"
+                );
             }
             // Pinning the REASON, not just the refusal: `0 >= 0` makes DIV §5 step 7 true with
             // nothing counted, so this receipt can be refused for the right rule or for none.
@@ -3249,6 +4097,20 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .to_string(),
+            excluded_signer_dids: i["requirement"]
+                .get("excludedSignerDids")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                }),
+            // Present-or-absent, as the reference spreads it (DIV §4.3.2).
+            require_enrolled_device: i["requirement"]
+                .get("requireEnrolledDevice")
+                .map(|value| value == &Value::Bool(true)),
         }
     }
 
@@ -3457,6 +4319,7 @@ mod tests {
                 .clone()
                 .unwrap_or_default()]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         WaVector {
             rp_id: doc["rpId"].as_str().unwrap().to_string(),
@@ -3549,6 +4412,7 @@ mod tests {
                 .clone()
                 .unwrap_or_default()]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         let res = verify_approval_receipt_with_options(
             &v.receipt,
@@ -3566,6 +4430,8 @@ mod tests {
             allowed_aaguids: vec![],
             requester_cannot_approve: false,
             signer_class: "human".to_string(),
+            excluded_signer_dids: None,
+            require_enrolled_device: None,
         }
     }
 
@@ -3579,6 +4445,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:deploy-pipeline".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         // Deliberately UNSORTED allowedAaguids: the builder sorts, and this pins that it does.
         let requirement = ApprovalRequirement {
@@ -3587,6 +4454,8 @@ mod tests {
             allowed_aaguids: vec!["b-aaguid".to_string(), "a-aaguid".to_string()],
             requester_cannot_approve: true,
             signer_class: "human".to_string(),
+            excluded_signer_dids: None,
+            require_enrolled_device: None,
         };
         let got = canonical_intent_payload(
             "prod-db-cluster-01",
@@ -3610,6 +4479,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:example:human".into(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let requirement = ApprovalRequirement {
             required_approvals: 1,
@@ -3729,6 +4599,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:deploy-pipeline".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let params = json!({ "environment": "staging" });
         let canonical = canonical_intent_payload(
@@ -3770,6 +4641,7 @@ mod tests {
             requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![STANDARD.encode(spki.as_bytes())]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         // Fail-closed by default.
         assert!(verify_approval_receipt(&receipt, &expected).is_err());
@@ -3869,6 +4741,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:agent".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         // What was actually approved: a harmless read on a sandbox, long expired.
         let approved_params = json!({ "path": "/tmp" });
@@ -3910,6 +4783,7 @@ mod tests {
             requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         let opted_in = VerifyOptions {
             allow_auto_approved: true,
@@ -3929,6 +4803,7 @@ mod tests {
             requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         // Refused by default even when the action lines up.
         assert!(verify_approval_receipt(&receipt, &matching).is_err());
@@ -3954,6 +4829,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:pipeline".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let params = json!({ "environment": "prod" });
         let canonical = canonical_offline_intent_payload(
@@ -3998,6 +4874,7 @@ mod tests {
             requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec![pub_b64]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         (receipt, expected)
     }
@@ -4088,6 +4965,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:x".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let from_runtime = canonical_intent_payload(
             "t",
@@ -4130,6 +5008,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:float-boundary".into(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let requirement = default_requirement();
         let tenant = Some("tenant-float");
@@ -4373,6 +5252,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:x".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let bad = json!({ "amount": 1e16 });
         assert!(canonical_intent_payload(
@@ -4429,6 +5309,7 @@ mod tests {
             requester_did: None,
             approvers: base.approvers,
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         let err = verify_approval_receipt(&receipt, &expected).expect_err("must fail closed");
         assert!(
@@ -4487,6 +5368,7 @@ mod tests {
         let requester = RequesterIdentity {
             did: "did:intyga:service:pipeline".to_string(),
             attestation: None,
+            credential_issuer_did: None,
         };
         let params = json!({ "environment": "prod" });
         let delegated_to = vec![
@@ -4547,6 +5429,7 @@ mod tests {
                 }),
             },
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         (receipt, expected)
     }
@@ -4695,6 +5578,7 @@ mod tests {
             requester_did: None,
             approvers,
             tenant_id: None,
+            enrolled_device_keys: None,
         }
     }
 
@@ -4917,6 +5801,7 @@ mod tests {
             requester_did: None,
             approvers: ApproverTrustAnchor::PublicKeys(vec!["a-listed-key".to_string()]),
             tenant_id: None,
+            enrolled_device_keys: None,
         };
         let err = verify_delegation(&receipt, &expected, &VerifyOptions::default()).unwrap_err();
         assert!(err.contains("§4.4.6"), "{err}");
@@ -4925,3 +5810,6 @@ mod tests {
 
 #[cfg(test)]
 mod parity_receipts_test;
+
+#[cfg(test)]
+mod webauthn_witness_test;

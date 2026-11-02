@@ -5,9 +5,7 @@
 //! presence/verification is enforced, the challenge must equal base64url(canonicalPayload), and the
 //! ES256 signature is checked over `authenticatorData ‖ SHA-256(clientDataJSON)`.
 
-use crate::{
-    parse_p256_public_key, verify_p256_signature, ApprovalReceipt, ApprovalWitness, VerifyOptions,
-};
+use crate::{parse_p256_public_key, ApprovalReceipt, ApprovalWitness, VerifyOptions};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use p256::ecdsa::VerifyingKey;
@@ -244,66 +242,237 @@ pub(super) fn cose_p256_fingerprint(cose_buf: &[u8]) -> Result<Vec<u8>, String> 
     parse_cose_p256_key(cose_buf).map(|key| key.to_encoded_point(false).as_bytes().to_vec())
 }
 
+/// The fields read from clientDataJSON. Each is optional and read loosely (a wrong JSON type reads
+/// as absent), so a hostile document is a refusal for the field it breaks, never a parse panic.
 #[derive(serde::Deserialize)]
 struct ClientData {
-    #[serde(rename = "type")]
-    type_: String,
-    #[serde(default)]
-    challenge: String,
-    #[serde(default)]
-    origin: String,
+    #[serde(rename = "type", default, deserialize_with = "loose_string")]
+    type_: Option<String>,
+    #[serde(default, deserialize_with = "loose_string")]
+    challenge: Option<String>,
+    #[serde(default, deserialize_with = "loose_string")]
+    origin: Option<String>,
     /// True when the ceremony ran inside a cross-origin frame. `origin` cannot detect this: an
     /// embedded RP page reports the RP's OWN origin and rpIdHash matches too, so this flag is the
     /// only signal separating "approved on our page" from "approved inside someone else's page"
     /// (W3C WebAuthn L3 §7.2 step 9).
-    #[serde(rename = "crossOrigin", default)]
-    cross_origin: bool,
-    /// WebAuthn L3: the top-level page when the ceremony ran in a frame.
-    #[serde(rename = "topOrigin", default)]
-    top_origin: Option<String>,
+    #[serde(rename = "crossOrigin", default, deserialize_with = "loose_bool")]
+    cross_origin: Option<bool>,
+    /// WebAuthn L3: the top-level page when the ceremony ran in a frame. Any present value other
+    /// than a string equal to `origin` differs from it, as `topOrigin !== origin` does.
+    #[serde(rename = "topOrigin", default, deserialize_with = "present_value")]
+    top_origin: Option<serde_json::Value>,
 }
 
-/// Verify one WEBAUTHN witness against an already-TRUSTED key. Requires `opts.expected_origin` and
-/// `opts.expected_rp_id`. The key comes from the caller's trust anchor — never from the receipt.
-pub(crate) fn verify_webauthn_witness(
+/// `Some` for any PRESENT value, `null` included (a plain `Option` would read `null` as absent).
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    <serde_json::Value as serde::Deserialize>::deserialize(d).map(Some)
+}
+
+fn loose_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(v.as_str().map(str::to_owned))
+}
+
+fn loose_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(v.as_bool())
+}
+
+/// Verify one WEBAUTHN witness of a receipt against an already-TRUSTED key (a COSE_Key). Requires
+/// `opts.expected_origin` and `opts.expected_rp_id`. The key comes from the caller's trust anchor —
+/// never from the receipt.
+pub(crate) fn verify_receipt_witness(
     witness: &ApprovalWitness,
     trusted_key: &str,
     receipt: &ApprovalReceipt,
     opts: &VerifyOptions,
 ) -> Result<(), String> {
-    let authenticator_data = witness
-        .authenticator_data
-        .as_ref()
-        .ok_or("WebAuthn receipt missing authenticatorData or clientDataJSON")?;
-    let client_data_json = witness
-        .client_data_json
-        .as_ref()
-        .ok_or("WebAuthn receipt missing authenticatorData or clientDataJSON")?;
+    let (Some(authenticator_data), Some(client_data_json)) = (
+        witness
+            .authenticator_data
+            .as_deref()
+            .filter(|s| !s.is_empty()),
+        witness
+            .client_data_json
+            .as_deref()
+            .filter(|s| !s.is_empty()),
+    ) else {
+        return Err("WebAuthn witness missing authenticatorData or clientDataJSON".to_string());
+    };
 
     // FAIL CLOSED: without an expected origin and RP ID there is nothing to pin the assertion to.
     let expected_origin = opts.expected_origin.as_deref().filter(|s| !s.is_empty());
     let expected_rp_id = opts.expected_rp_id.as_deref().filter(|s| !s.is_empty());
-    let (expected_origin, expected_rp_id) = match (expected_origin, expected_rp_id) {
-        (Some(o), Some(r)) => (o, r),
-        _ => {
-            return Err("WebAuthn receipts require expected_origin and expected_rp_id — without them an assertion from any relying party would verify".to_string())
+    let (Some(expected_origin), Some(expected_rp_id)) = (expected_origin, expected_rp_id) else {
+        return Err("WebAuthn receipts require expected_origin and expected_rp_id — without them an assertion from any relying party would verify".to_string());
+    };
+    verify_assertion(
+        authenticator_data,
+        client_data_json,
+        &witness.signature,
+        // The COSE key is parsed from the TRUSTED key, not from the receipt's copy.
+        trusted_key,
+        KeyForm::Cose,
+        &receipt.canonical_payload,
+        &AssertionExpectation {
+            origins: &[expected_origin],
+            rp_id: expected_rp_id,
+            require_user_verification: opts.require_user_verification.unwrap_or(true),
+            allow_cross_origin: opts.allow_cross_origin.unwrap_or(false),
+        },
+    )
+}
+
+/// One WebAuthn assertion and the exact payload it claims to sign — a single stored witness row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebAuthnWitness {
+    /// The exact bytes the assertion's challenge commits to (base64url of them is the challenge).
+    #[serde(default)]
+    pub signed_payload: String,
+    /// The credential's P-256 public key, base64: DER SPKI or a COSE_Key. From YOUR trust policy.
+    #[serde(default)]
+    pub public_key: String,
+    /// base64 or base64url, as the browser returned them.
+    #[serde(default)]
+    pub authenticator_data: String,
+    #[serde(default, rename = "clientDataJSON")]
+    pub client_data_json: String,
+    /// The DER ECDSA assertion signature (a raw r‖s encoding is refused).
+    #[serde(default)]
+    pub signature: String,
+}
+
+/// What a standalone WebAuthn witness must be bound to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebAuthnWitnessExpectation {
+    /// The origin(s) the assertion may carry, e.g. `"https://app.example.com"`. Required: at least
+    /// one, every one non-empty.
+    pub expected_origin: Vec<String>,
+    /// The RP ID the authenticatorData must hash to, e.g. `"app.example.com"`. Required.
+    pub expected_rp_id: String,
+    /// Demand the User-Verified flag. `None` means TRUE; User-Present is always required.
+    pub require_user_verification: Option<bool>,
+    /// Accept `clientDataJSON.crossOrigin: true` / a differing `topOrigin`. Defaults to false
+    /// (DIV §4.4.5 rule 5).
+    pub allow_cross_origin: bool,
+}
+
+/// Verify ONE WebAuthn assertion on its own — the DIV §4.4.5 checks every receipt verifier here
+/// applies to each WEBAUTHN witness, without a receipt around it: one approver of a quorum, a console
+/// step-up, a login approval, a row read back out of an audit ledger. Same implementation as the
+/// receipt path, not a copy.
+///
+/// It answers only "did the holder of THIS key sign THIS payload, at THIS relying party, with the
+/// user present". It knows nothing of quorum, validity windows, payload type, the signed requirement
+/// or who the key belongs to: to verify an approval use `verify_approval_receipt` (or the
+/// delegation, agent-authority and platform verifiers), which also enforce those. Never panics on
+/// hostile input; every refusal is an `Err` with the reference's reason.
+pub fn verify_webauthn_witness(
+    witness: &WebAuthnWitness,
+    expectation: &WebAuthnWitnessExpectation,
+) -> Result<(), String> {
+    // Fail closed, as the receipt path does: with nothing pinned, an assertion from any RP verifies.
+    if expectation.expected_origin.is_empty()
+        || expectation.expected_origin.iter().any(String::is_empty)
+        || expectation.expected_rp_id.is_empty()
+    {
+        return Err("a WebAuthn witness requires expected_origin and expected_rp_id — without them an assertion from any relying party would verify".to_string());
+    }
+    for (field, value) in [
+        ("signedPayload", &witness.signed_payload),
+        ("publicKey", &witness.public_key),
+        ("authenticatorData", &witness.authenticator_data),
+        ("clientDataJSON", &witness.client_data_json),
+        ("signature", &witness.signature),
+    ] {
+        if value.is_empty() {
+            return Err(format!("WebAuthn witness missing {field}"));
+        }
+    }
+    let origins: Vec<&str> = expectation
+        .expected_origin
+        .iter()
+        .map(String::as_str)
+        .collect();
+    verify_assertion(
+        &witness.authenticator_data,
+        &witness.client_data_json,
+        &witness.signature,
+        &witness.public_key,
+        KeyForm::SpkiOrCose,
+        &witness.signed_payload,
+        &AssertionExpectation {
+            origins: &origins,
+            rp_id: &expectation.expected_rp_id,
+            require_user_verification: expectation.require_user_verification.unwrap_or(true),
+            allow_cross_origin: expectation.allow_cross_origin,
+        },
+    )
+}
+
+/// How the credential key is encoded.
+#[derive(Clone, Copy)]
+enum KeyForm {
+    /// A COSE_Key (the receipt path's trusted keys).
+    Cose,
+    /// DER SPKI (a SEQUENCE, first byte 0x30) or a COSE_Key (the standalone witness).
+    SpkiOrCose,
+}
+
+struct AssertionExpectation<'a> {
+    origins: &'a [&'a str],
+    rp_id: &'a str,
+    require_user_verification: bool,
+    allow_cross_origin: bool,
+}
+
+/// The one WebAuthn assertion check (the reference's `verifyWebAuthnAssertion`). Errors that the
+/// reference raises from a decoder or key parser surface as "WebAuthn verification failed: …".
+fn verify_assertion(
+    authenticator_data: &str,
+    client_data_json: &str,
+    signature: &str,
+    key: &str,
+    form: KeyForm,
+    signed_payload: &str,
+    expect: &AssertionExpectation<'_>,
+) -> Result<(), String> {
+    let failed = |why: &str| format!("WebAuthn verification failed: {why}");
+    let client_data_buf = decode_base64_flexible(client_data_json)
+        .map_err(|_| failed("clientDataJSON is not base64"))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&client_data_buf)
+        .map_err(|_| failed("clientDataJSON is not valid JSON"))?;
+    // `null` has no fields to read (the reference throws reading one); any other non-object simply
+    // has no `type`, and is refused as not an assertion.
+    if parsed.is_null() {
+        return Err(failed("clientDataJSON is null"));
+    }
+    let client_data: ClientData = if parsed.is_object() {
+        serde_json::from_value(parsed).map_err(|_| failed("clientDataJSON is not valid JSON"))?
+    } else {
+        ClientData {
+            type_: None,
+            challenge: None,
+            origin: None,
+            cross_origin: None,
+            top_origin: None,
         }
     };
 
-    let client_data_buf = decode_base64_flexible(client_data_json)
-        .map_err(|_| "invalid clientDataJSON base64".to_string())?;
-    let client_data: ClientData = serde_json::from_slice(&client_data_buf)
-        .map_err(|_| "clientDataJSON is not valid JSON".to_string())?;
-
     // An assertion, not a registration: webauthn.create signs a different ceremony over the same
     // challenge bytes and must never be accepted as approval.
-    if client_data.type_ != "webauthn.get" {
+    if client_data.type_.as_deref() != Some("webauthn.get") {
         return Err("clientDataJSON is not a webauthn.get assertion".to_string());
     }
-    if client_data.origin != expected_origin {
+    let origin = client_data.origin.as_deref();
+    if !origin.is_some_and(|o| expect.origins.contains(&o)) {
         return Err("assertion origin does not match expected_origin".to_string());
     }
-    if client_data.cross_origin && !opts.allow_cross_origin.unwrap_or(false) {
+    if client_data.cross_origin == Some(true) && !expect.allow_cross_origin {
         return Err(
             "assertion was produced in a cross-origin frame (crossOrigin=true)".to_string(),
         );
@@ -312,27 +481,38 @@ pub(crate) fn verify_webauthn_witness(
     // exactly like crossOrigin=true (DIV §4.4.5 rule 5) — the gateway refuses it at ingest.
     if client_data
         .top_origin
-        .as_deref()
-        .is_some_and(|top| top != client_data.origin)
-        && !opts.allow_cross_origin.unwrap_or(false)
+        .as_ref()
+        .is_some_and(|top| top.as_str() != origin)
+        && !expect.allow_cross_origin
     {
         return Err(
             "assertion was produced in a frame embedded by another origin (topOrigin differs from origin)"
                 .to_string(),
         );
     }
-    let expected_challenge = URL_SAFE_NO_PAD.encode(receipt.canonical_payload.as_bytes());
-    let client_challenge = client_data.challenge.trim_end_matches('=');
+    let Some(challenge) = client_data.challenge.as_deref() else {
+        return Err(failed("clientDataJSON challenge is not a string"));
+    };
+    let expected_challenge = URL_SAFE_NO_PAD.encode(signed_payload.as_bytes());
+    let client_challenge: String = challenge
+        .chars()
+        .filter(|c| *c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            other => other,
+        })
+        .collect();
     if client_challenge != expected_challenge {
         return Err("clientDataJSON challenge does not match canonical payload".to_string());
     }
 
     let auth_data = decode_base64_flexible(authenticator_data)
-        .map_err(|_| "invalid authenticatorData base64".to_string())?;
+        .map_err(|_| failed("authenticatorData is not base64"))?;
     if auth_data.len() < 37 {
         return Err("authenticatorData is too short".to_string());
     }
-    let rp_id_hash = Sha256::digest(expected_rp_id.as_bytes());
+    let rp_id_hash = Sha256::digest(expect.rp_id.as_bytes());
     // Constant-time compare of the 32-byte rpIdHash.
     if !constant_time_eq(&auth_data[..32], &rp_id_hash) {
         return Err("authenticatorData rpIdHash does not match expected_rp_id".to_string());
@@ -341,27 +521,53 @@ pub(crate) fn verify_webauthn_witness(
     if flags & AUTH_DATA_FLAG_UP == 0 {
         return Err("authenticatorData user-present flag is not set".to_string());
     }
-    let require_uv = opts.require_user_verification.unwrap_or(true);
-    if require_uv && flags & AUTH_DATA_FLAG_UV == 0 {
+    if expect.require_user_verification && flags & AUTH_DATA_FLAG_UV == 0 {
         return Err("authenticatorData user-verified flag is not set".to_string());
     }
 
-    // The COSE key is parsed from the TRUSTED key, not the receipt's copy.
-    let cose_buf = decode_base64_flexible(trusted_key)
-        .map_err(|_| "invalid trusted key base64".to_string())?;
-    let verifying_key = parse_cose_p256_key(&cose_buf)?;
+    let key_buf = decode_base64_flexible(key).map_err(|_| failed("public key is not base64"))?;
+    let verifying_key = match form {
+        KeyForm::SpkiOrCose if key_buf.first() == Some(&0x30) => spki_p256_key(&key_buf),
+        _ => parse_cose_p256_key(&key_buf).map_err(|why| capitalized(&why)),
+    }
+    .map_err(|why| failed(&why))?;
 
-    let sig_bytes = decode_base64_flexible(&witness.signature)
-        .map_err(|_| "invalid signature base64".to_string())?;
-
+    let sig_bytes = decode_base64_flexible(signature).unwrap_or_default();
     let client_data_hash = Sha256::digest(&client_data_buf);
-    let mut signed_data = auth_data.clone();
+    let mut signed_data = auth_data;
     signed_data.extend_from_slice(&client_data_hash);
 
-    if verify_p256_signature(&verifying_key, &signed_data, &sig_bytes) {
+    // A WebAuthn ES256 assertion signature is ASN.1 DER (WebAuthn §6.5.6); unlike a bare-key ES256
+    // witness, a raw r||s encoding is refused, as in every other port.
+    let der_only = p256::ecdsa::Signature::from_der(&sig_bytes)
+        .ok()
+        .map(|sig| {
+            use p256::ecdsa::signature::Verifier;
+            verifying_key.verify(&signed_data, &sig).is_ok()
+        })
+        .unwrap_or(false);
+    if der_only {
         Ok(())
     } else {
         Err("WebAuthn signature does not verify against the trusted signer key".to_string())
+    }
+}
+
+/// A DER SPKI credential key, pinned to P-256 (the reference refuses any other key type or curve).
+fn spki_p256_key(der: &[u8]) -> Result<VerifyingKey, String> {
+    use p256::pkcs8::DecodePublicKey;
+    match p256::PublicKey::from_public_key_der(der) {
+        Ok(key) => Ok(VerifyingKey::from(&key)),
+        // A well-formed SPKI for another algorithm or curve, or not an SPKI at all.
+        Err(_) => Err("public key is not a P-256 key".to_string()),
+    }
+}
+
+/// The reference spells the COSE parser's errors "Invalid COSE public key format: …".
+fn capitalized(why: &str) -> String {
+    match why.strip_prefix("invalid COSE") {
+        Some(rest) => format!("Invalid COSE{rest}"),
+        None => why.to_string(),
     }
 }
 

@@ -62,6 +62,24 @@ floor demands one — is refused before any signature is counted, with a reason 
 requirement is weaker than the relying party's policy"; an equal or stricter one passes. A malformed
 floor (quorum below 1) is refused rather than ignored. The same field exists on the delegation
 expectation (pass the ordinary rule) and the agent-authority expectation (your sealing policy).
+The floor's `excluded_signer_dids` is a typed `Option`: `None` means no exclusion floor, and
+`Some(vec![])` demands that the signed field be present. Unlike the TypeScript and Python floors,
+which are plain objects and refuse an explicit `null` as malformed, a floor you deserialize yourself
+reads `null` as `None`. Receipts are different: an explicit `null` issuer or exclusion set inside a
+receipt is refused, never read as absent.
+
+**Enrolled approver devices (DIV §4.3.2).** A signed requirement may carry
+`requireEnrolledDevice: true` (only on an ordinary `div-intent-verification`, never with
+`requireHardwareKey` or a non-empty `allowedAaguids`). It binds to `ApprovalRequirement::require_enrolled_device`
+(`None` when absent; a present `false`, `null` or non-boolean binds as `Some(false)` and is refused as
+malformed). Such a receipt verifies only when you supply `Expected { enrolled_device_keys: Some(keys), .. }`
+— the enrolled device keys from YOUR enrollment records, e.g. a console trust-anchor export's
+`enrolledDeviceKeys` — and then a witness counts only if it is ES256 and verified under a trusted
+approver key that is also in that list (SPKI and COSE spellings of one key match). The list narrows,
+it never adds trust; without it, or with an empty list, verification is refused. It is ignored when
+the signed requirement does not set the field; pass `None` otherwise. The floor's
+`require_enrolled_device: true` refuses a signed requirement that does not demand an enrolled device.
+`Expected` gained this field, so existing struct literals need `enrolled_device_keys: None`.
 
 `verify_approval_receipt(&receipt, &expected)` is a shorthand for ES256 receipts. One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -83,6 +101,10 @@ verify_approval_receipt_with_options(&receipt, &expected, &opts)?;
 ## Receipt and audit verification
 
 Use `verify_platform_receipt` and `verify_agent_authority` for the additional DIV receipt types.
+Use `verify_webauthn_witness(&WebAuthnWitness, &WebAuthnWitnessExpectation)` to check ONE WebAuthn
+assertion on its own (an audit-ledger row, a step-up): it runs the same DIV §4.4.5 checks as the
+receipt path — origin(s), RP ID, user presence/verification, cross-origin refusal, the challenge,
+and a DER signature under a DER SPKI or COSE_Key P-256 key — and nothing about quorum or policy.
 `bundle::verify_bundle` verifies single proofs; `bundle::verify_evidence_bundle_with_options`
 adds caller-policy anchoring to multi-event exports. The existing `verify_evidence_bundle` entry
 point remains available for callers that only pin roots. Supply `EvidenceAnchorSet::ByCheckpoint`
@@ -156,7 +178,8 @@ verification. `ExecutionOptions`:
   A negative value falls back to the default.
 - `require_execution_confirmed` — fail unless the bundle reports at least one nonce and every one is
   `confirmed`, with no dispatch conflict, late contradiction, untrusted contradiction, source gap or
-  divergence.
+  divergence, and no `COMMITMENT_ONLY` entry in the covered bundle. Without this option, redacted
+  entries retain inclusion-only validity and remain reported as commitment-only.
 
 The result's `execution` carries one check per Evidence Record (`status`, `reason`, `trusted`,
 `nonce`, `verdict`, `source`, `sequence`), a per-nonce report (`status`, the governing

@@ -321,7 +321,7 @@ pub fn verify_audit_signature_with_evidence(
                 client_data_json: w["clientDataJSON"].as_str().map(str::to_string),
             };
             let receipt:crate::ApprovalReceipt=serde_json::from_value(serde_json::json!({"canonicalPayload":c["signedPayload"],"actionDescription":"","params":{},"verificationCode":""})).expect("static receipt shape");
-            crate::webauthn::verify_webauthn_witness(
+            crate::webauthn::verify_receipt_witness(
                 &witness,
                 key,
                 &receipt,
@@ -858,6 +858,13 @@ fn finish_execution(
     );
     if !x.require_execution_confirmed {
         return;
+    }
+    if r.commitment_only > 0 {
+        r.failed.push((
+            "-".into(),
+            "Required confirmed execution: COMMITMENT_ONLY entries may conceal execution evidence"
+                .into(),
+        ));
     }
     if r.execution.by_nonce.is_empty() {
         r.failed.push((
