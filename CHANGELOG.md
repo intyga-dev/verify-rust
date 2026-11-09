@@ -3,6 +3,19 @@
 All notable changes to `intyga-verify` (Rust) are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [2.4.0]
+
+- Signed instants are compared in milliseconds, as the reference does (audit A-02, 6 Nov 2026): an
+  authority whose `expiresAt` precedes its `sealedAt` inside one second, a child authority outliving
+  its parent by a fraction of a second, and platform / delegation / offline bounds no longer pass
+  through whole-second truncation. `as_of_unix_secs` and `clock_skew_seconds` keep their meaning.
+- Malformed witnesses are a refusal before any witness is counted (audit A-04): an element whose
+  `signature` is empty refuses the whole artifact with the reference's reason
+  ("receipt carries a malformed witness: signature is not a string"; `delegation …` / `authority …`);
+  elements serde cannot parse were already refused.
+- Pinned by the new shared `tenant-binding-vectors.json` cases (subsecond interval, child outlives
+  parent, malformed and empty-signature witness beside a valid one).
+
 ## [2.3.0]
 
 - DIV §4.3.2 "Enrolled approver devices" (targets DIV 1.3.0). `ApprovalRequirement` gains

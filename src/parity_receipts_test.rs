@@ -584,8 +584,19 @@ fn shared_tenant_binding_verifier_vectors() {
                         .collect();
                     opts.agent_authority_chain = Some(std::sync::Arc::new(chain));
                 }
-                let receipt: ApprovalReceipt =
-                    serde_json::from_value(case["receipt"].clone()).unwrap();
+                let receipt: ApprovalReceipt = match serde_json::from_value(case["receipt"].clone())
+                {
+                    Ok(receipt) => receipt,
+                    // A receipt this port's types refuse to parse (a null witness, say) is a
+                    // refusal, never a pass: the case must expect one.
+                    Err(err) => {
+                        assert!(
+                            !case["ok"].as_bool().unwrap(),
+                            "{name}: unparseable receipt: {err}"
+                        );
+                        continue;
+                    }
+                };
                 let expected = tenant_expected(&case["expected"], &keys, tenant);
                 if let Some(agent_context) = case["expected"].get("agentContext") {
                     verify_agent_approval_receipt(&receipt, &expected, agent_context, &opts)

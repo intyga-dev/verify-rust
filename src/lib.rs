@@ -1866,6 +1866,15 @@ fn evaluation_time(opts: &VerifyOptions) -> (i64, i64) {
     )
 }
 
+/// [`evaluation_time`] in milliseconds. Signed instants are compared at millisecond precision, as
+/// the reference does (`nowMs + skewMs`): truncating a signed `expiresAt`/`sealedAt` to the second
+/// before the comparison admitted intervals the other ports refuse (an authority expiring 800 ms
+/// before it was sealed, a child outliving its parent by 800 ms).
+fn evaluation_time_ms(opts: &VerifyOptions) -> (i64, i64) {
+    let (now, skew) = evaluation_time(opts);
+    (now * 1000, skew * 1000)
+}
+
 /// Verify an ApprovalReceipt offline, with relying-party context.
 ///
 /// Recomputes the canonical payload from the caller's own params, confirms it byte-matches what
@@ -2071,7 +2080,6 @@ fn verify_approval_receipt_inner(
             .ok_or("offline proof is missing challengedAt")?;
         let challenged_ms = parse_rfc3339_utc_ms(&challenged_at)
             .ok_or("challengedAt is not a valid RFC3339 timestamp")?;
-        let challenged = challenged_ms.div_euclid(1000);
         // An unparseable `expiresAt` must be refused HERE rather than skipping the window cap and
         // relying on the expiry check further down — that check is disabled by `allow_expired`, so
         // the `allow_offline + allow_expired` combination (the documented forensic re-verification
@@ -2106,8 +2114,8 @@ fn verify_approval_receipt_inner(
         // verifies today and keeps verifying until that date — the pre-signed bearer capability
         // §5a.1 rejects. NOT gated on `allow_expired`: that override re-examines a proof that WAS
         // valid and has lapsed, and says nothing about one dated in the future.
-        let (now, skew) = evaluation_time(opts);
-        if challenged > now + skew {
+        let (now_ms, skew_ms) = evaluation_time_ms(opts);
+        if challenged_ms > now_ms + skew_ms {
             return Err("offline proof is challenged in the future (DIV §5a.3)".to_string());
         }
         // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4). WebAuthn needs a secure
@@ -2128,11 +2136,11 @@ fn verify_approval_receipt_inner(
         if d.tenant_id != tenant_id {
             return Err("delegation and approval belong to different tenants".into());
         }
-        let expiry = parse_rfc3339_utc_secs(&d.expires_at)
+        let expiry_ms = parse_rfc3339_utc_ms(&d.expires_at)
             .ok_or("delegation expiresAt is not a valid RFC3339 timestamp")?;
         if !opts.allow_expired {
-            let (now, skew) = evaluation_time(opts);
-            if now > expiry + skew {
+            let (now_ms, skew_ms) = evaluation_time_ms(opts);
+            if now_ms > expiry_ms + skew_ms {
                 return Err(
                     "delegation has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)"
                         .to_string(),
@@ -2220,10 +2228,10 @@ fn verify_approval_receipt_inner(
 
     // Expiration (DIV §5.8/§6.2). Fail-closed by default; opt out only for audit re-verification.
     if !opts.allow_expired {
-        let expiry = parse_rfc3339_utc_secs(&expires_at)
+        let expiry_ms = parse_rfc3339_utc_ms(&expires_at)
             .ok_or("expiresAt is not a valid RFC3339 timestamp")?;
-        let (now, skew) = evaluation_time(opts);
-        if now > expiry + skew {
+        let (now_ms, skew_ms) = evaluation_time_ms(opts);
+        if now_ms > expiry_ms + skew_ms {
             return Err(
                 "proof has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".to_string(),
             );
@@ -2263,6 +2271,9 @@ fn verify_approval_receipt_inner(
         }
     }
 
+    if let Some(problem) = witness_problem(receipt, "receipt") {
+        return Err(problem);
+    }
     let witnesses = witnesses_of(receipt);
     if witnesses.is_empty() {
         return Err("receipt missing signature material".to_string());
@@ -2507,18 +2518,20 @@ pub fn verify_platform_receipt(
     if recomputed != receipt.canonical_payload {
         return Err("payloadHash/rpId do not match what was signed".into());
     }
-    let signed =
-        parse_rfc3339_utc_secs(signed_at).ok_or("signedAt is not a valid RFC3339 timestamp")?;
-    let expiry =
-        parse_rfc3339_utc_secs(expires_at).ok_or("expiresAt is not a valid RFC3339 timestamp")?;
-    if expiry < signed {
+    // Millisecond precision throughout, like the reference: a receipt signed 800 ms after its own
+    // expiry is inverted even though both instants share a second.
+    let signed_ms =
+        parse_rfc3339_utc_ms(signed_at).ok_or("signedAt is not a valid RFC3339 timestamp")?;
+    let expiry_ms =
+        parse_rfc3339_utc_ms(expires_at).ok_or("expiresAt is not a valid RFC3339 timestamp")?;
+    if expiry_ms < signed_ms {
         return Err("receipt expires before it was signed".into());
     }
-    let (now, skew) = evaluation_time(opts);
-    if signed > now + skew {
+    let (now_ms, skew_ms) = evaluation_time_ms(opts);
+    if signed_ms > now_ms + skew_ms {
         return Err("receipt is signed in the future (DIV §5c.3)".into());
     }
-    if !opts.allow_expired && now > expiry + skew {
+    if !opts.allow_expired && now_ms > expiry_ms + skew_ms {
         return Err("proof has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".into());
     }
     if receipt.sig_alg.as_deref() == Some("AUTO_APPROVED") {
@@ -2527,6 +2540,9 @@ pub fn verify_platform_receipt(
         );
     }
     let normalized = platform_as_approval(receipt);
+    if let Some(problem) = witness_problem(&normalized, "receipt") {
+        return Err(problem);
+    }
     let witnesses = witnesses_of(&normalized);
     if witnesses.is_empty() {
         return Err("receipt missing signature material".into());
@@ -2668,15 +2684,17 @@ pub fn verify_agent_authority(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or("authority is missing expiresAt")?;
-    let sealed =
-        parse_rfc3339_utc_secs(sealed_at).ok_or("sealedAt is not a valid RFC3339 timestamp")?;
-    let expiry =
-        parse_rfc3339_utc_secs(expires_at).ok_or("expiresAt is not a valid RFC3339 timestamp")?;
-    if expiry < sealed {
+    // Millisecond precision, as the reference compares them (DIV §5b.2): the interval is inverted
+    // when `expiresAt` precedes `sealedAt` by any amount, including inside one second.
+    let sealed_ms =
+        parse_rfc3339_utc_ms(sealed_at).ok_or("sealedAt is not a valid RFC3339 timestamp")?;
+    let expiry_ms =
+        parse_rfc3339_utc_ms(expires_at).ok_or("expiresAt is not a valid RFC3339 timestamp")?;
+    if expiry_ms < sealed_ms {
         return Err("authority expires before it was sealed".into());
     }
-    let (now, skew) = evaluation_time(opts);
-    if sealed > now + skew {
+    let (now_ms, skew_ms) = evaluation_time_ms(opts);
+    if sealed_ms > now_ms + skew_ms {
         return Err("authority is sealed in the future (DIV §5b.2)".into());
     }
     let requester = receipt
@@ -2726,11 +2744,14 @@ pub fn verify_agent_authority(
     if recomputed != receipt.canonical_payload {
         return Err("target/agent/actionPatterns do not match what was sealed".into());
     }
-    if !opts.allow_expired && now > expiry + skew {
+    if !opts.allow_expired && now_ms > expiry_ms + skew_ms {
         return Err("authority has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".into());
     }
     if receipt.sig_alg.as_deref() == Some("AUTO_APPROVED") {
         return Err("an agent authority cannot be auto-approved — granting agent scope requires human signatures".into());
+    }
+    if let Some(problem) = witness_problem(receipt, "authority") {
+        return Err(problem);
     }
     let witnesses = witnesses_of(receipt);
     if witnesses.is_empty() {
@@ -2909,13 +2930,15 @@ pub fn verify_agent_delegation_chain(
             if authority.tenant_id != previous.tenant_id {
                 return Err("authority chain crosses tenant boundaries".into());
             }
-            let child_sealed = parse_rfc3339_utc_secs(&authority.sealed_at)
+            // Containment to the millisecond (DIV §5b.3): a child expiring 800 ms after its parent
+            // outlives it, even though the two instants share a second.
+            let child_sealed = parse_rfc3339_utc_ms(&authority.sealed_at)
                 .ok_or("child authority has an invalid sealedAt")?;
-            let parent_sealed = parse_rfc3339_utc_secs(&previous.sealed_at)
+            let parent_sealed = parse_rfc3339_utc_ms(&previous.sealed_at)
                 .ok_or("parent authority has an invalid sealedAt")?;
-            let child_expires = parse_rfc3339_utc_secs(&authority.expires_at)
+            let child_expires = parse_rfc3339_utc_ms(&authority.expires_at)
                 .ok_or("child authority has an invalid expiresAt")?;
-            let parent_expires = parse_rfc3339_utc_secs(&previous.expires_at)
+            let parent_expires = parse_rfc3339_utc_ms(&previous.expires_at)
                 .ok_or("parent authority has an invalid expiresAt")?;
             if child_sealed < parent_sealed || child_expires > parent_expires {
                 return Err("child authority outlives or predates its parent".into());
@@ -3052,7 +3075,6 @@ pub fn verify_delegation(
         parse_rfc3339_utc_ms(&sealed_at).ok_or("sealedAt is not a valid RFC3339 timestamp")?;
     let expiry_ms =
         parse_rfc3339_utc_ms(&expires_at).ok_or("expiresAt is not a valid RFC3339 timestamp")?;
-    let (sealed, expiry) = (sealed_ms.div_euclid(1000), expiry_ms.div_euclid(1000));
     let window_ms = expiry_ms - sealed_ms;
     if window_ms < 0 {
         return Err("delegation expires before it was sealed".to_string());
@@ -3066,8 +3088,8 @@ pub fn verify_delegation(
     // Position, not just width (DIV §5a.6 step 1, mirroring §5a.3 rule 3). A forward-dated
     // `sealedAt` slides the 72-hour window arbitrarily far out, and §5a.8 names that cap as
     // Delegation's ONLY mitigation. Unconditional, like the offline mirror.
-    let (now, skew) = evaluation_time(opts);
-    if sealed > now + skew {
+    let (now_ms, skew_ms) = evaluation_time_ms(opts);
+    if sealed_ms > now_ms + skew_ms {
         return Err("delegation is sealed in the future (DIV §5a.6)".to_string());
     }
 
@@ -3123,7 +3145,7 @@ pub fn verify_delegation(
         return Err("target/params/actionType do not match what was delegated".to_string());
     }
 
-    if !opts.allow_expired && now > expiry + skew {
+    if !opts.allow_expired && now_ms > expiry_ms + skew_ms {
         return Err(
             "delegation has expired (pass VerifyOptions { allow_expired: true, .. } for audit re-verification)".to_string(),
         );
@@ -3132,6 +3154,9 @@ pub fn verify_delegation(
         return Err("a delegation cannot be auto-approved — delegating approval authority requires human signatures".to_string());
     }
 
+    if let Some(problem) = witness_problem(receipt, "delegation") {
+        return Err(problem);
+    }
     let witnesses = witnesses_of(receipt);
     if witnesses.is_empty() {
         return Err("delegation missing signature material".to_string());
@@ -3349,6 +3374,18 @@ fn seed_excluded_signing_keys(
     Ok(())
 }
 
+/// Structural refusal of a malformed witness element, mirroring the reference's `witnessProblem`
+/// (DIV: a witness array is one artifact; one bad element refuses the whole receipt). Serde already
+/// refuses a null, non-object or non-string element and a missing `signature`/`signerPublicKey`; what
+/// it admits and the reference does not is an EMPTY `signature`, so that is checked here, with the
+/// reference's exact reason. `artifact` is "receipt", "delegation" or "authority".
+fn witness_problem(receipt: &ApprovalReceipt, artifact: &str) -> Option<String> {
+    let sigs = receipt.signatures.as_ref()?;
+    sigs.iter()
+        .find(|w| w.signature.is_empty())
+        .map(|_| format!("{artifact} carries a malformed witness: signature is not a string"))
+}
+
 fn witnesses_of(receipt: &ApprovalReceipt) -> Vec<ApprovalWitness> {
     if let Some(sigs) = &receipt.signatures {
         if !sigs.is_empty() {
@@ -3499,6 +3536,134 @@ mod tests {
             enrolled_device_keys: None,
         };
         (receipt, expected)
+    }
+
+    // Audit 2026-11-06 A-02: this port compared sealedAt/expiresAt truncated to the second, so an
+    // authority expiring 800 ms before it was sealed, and a child outliving its parent by 800 ms,
+    // verified here and nowhere else. Comparisons are now to the millisecond, like the reference.
+    fn signed_authority(
+        agent_did: &str,
+        sealed_at: &str,
+        expires_at: &str,
+        parent: Option<&str>,
+    ) -> (ApprovalReceipt, AgentAuthorityExpectation) {
+        let requester = RequesterIdentity {
+            did: "did:intyga:admin".to_string(),
+            attestation: None,
+            credential_issuer_did: None,
+        };
+        let canonical = canonical_agent_authority_payload_with_parent_and_tenant(
+            "prod-payments",
+            &["payments.".to_string()],
+            "Payments scope",
+            agent_did,
+            &requester,
+            &default_requirement(),
+            "authority-nonce",
+            sealed_at,
+            expires_at,
+            parent,
+            None,
+        )
+        .expect("canonicalize authority");
+        let sk = test_signing_key();
+        let sig: Signature = sk.sign(canonical.as_bytes());
+        let spki = STANDARD.encode(
+            sk.verifying_key()
+                .to_public_key_der()
+                .expect("SPKI")
+                .as_bytes(),
+        );
+        let receipt = ApprovalReceipt {
+            canonical_payload: canonical,
+            target: Some("prod-payments".to_string()),
+            action_type: None,
+            action_description: "Payments scope".to_string(),
+            params: json!({}),
+            signer_did: Some("did:intyga:alice".to_string()),
+            signer_public_key: Some(spki.clone()),
+            signature: Some(STANDARD.encode(sig.to_der().as_bytes())),
+            sig_alg: Some("ES256".to_string()),
+            authenticator_data: None,
+            client_data_json: None,
+            requester: Some(requester),
+            signatures: None,
+            verification_code: "1234".to_string(),
+        };
+        let expected = AgentAuthorityExpectation {
+            approvers: ApproverTrustAnchor::PublicKeys(vec![spki]),
+            target: "prod-payments".to_string(),
+            agent_did: agent_did.to_string(),
+            requirement: None,
+            tenant_id: None,
+        };
+        (receipt, expected)
+    }
+
+    fn authority_opts() -> VerifyOptions {
+        VerifyOptions {
+            as_of_unix_secs: parse_rfc3339_utc_secs("2026-09-01T12:01:00Z"),
+            ..VerifyOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_authority_interval_inverted_inside_one_second_is_refused() {
+        let (receipt, expected) = signed_authority(
+            "did:intyga:agent:payments",
+            "2026-09-01T12:00:00.900Z",
+            "2026-09-01T12:00:00.100Z",
+            None,
+        );
+        let err = verify_agent_authority(&receipt, &expected, &authority_opts()).unwrap_err();
+        assert_eq!(err, "authority expires before it was sealed");
+    }
+
+    #[test]
+    fn test_authority_interval_ordered_by_100ms_verifies() {
+        let (receipt, expected) = signed_authority(
+            "did:intyga:agent:payments",
+            "2026-09-01T12:00:00.100Z",
+            "2027-09-01T12:00:00.200Z",
+            None,
+        );
+        assert!(verify_agent_authority(&receipt, &expected, &authority_opts()).is_ok());
+    }
+
+    #[test]
+    fn test_child_authority_outliving_parent_by_800ms_is_refused() {
+        let (root, root_expected) = signed_authority(
+            "did:intyga:agent:payments",
+            "2026-09-01T12:00:00.000Z",
+            "2027-09-01T12:00:00.100Z",
+            None,
+        );
+        let root_digest = agent_receipt_digest(&root).expect("root digest");
+        let (child, child_expected) = signed_authority(
+            "did:intyga:agent:worker",
+            "2026-09-01T12:00:00.000Z",
+            "2027-09-01T12:00:00.900Z",
+            Some(&root_digest),
+        );
+        let action = AgentDelegatedAction {
+            tenant_id: None,
+            target: "prod-payments".to_string(),
+            action_type: "payments.refund".to_string(),
+            agent_did: "did:intyga:agent:worker".to_string(),
+            delegated_by: agent_receipt_digest(&child).expect("child digest"),
+        };
+        let chain = [
+            AgentAuthorityChainLink {
+                receipt: root,
+                expected: root_expected,
+            },
+            AgentAuthorityChainLink {
+                receipt: child,
+                expected: child_expected,
+            },
+        ];
+        let err = verify_agent_delegation_chain(&chain, &action, &authority_opts()).unwrap_err();
+        assert_eq!(err, "child authority outlives or predates its parent");
     }
 
     #[test]
@@ -5334,6 +5499,55 @@ mod tests {
             authenticator_data: None,
             client_data_json: None,
         }
+    }
+
+    /// Audit A-04 parity: the witness array is ONE artifact. An element serde admits but the reference
+    /// refuses — an empty `signature` — refuses the whole receipt, even beside a witness that verifies.
+    #[test]
+    fn test_empty_signature_beside_valid_witness_is_refused() {
+        let (mut receipt, expected) = signed_receipt();
+        let witness = witness_of(&receipt);
+        receipt.signatures = Some(vec![witness.clone()]);
+        verify_approval_receipt(&receipt, &expected)
+            .expect("control: the valid witness alone verifies");
+
+        let empty = ApprovalWitness {
+            signature: String::new(),
+            ..witness.clone()
+        };
+        receipt.signatures = Some(vec![witness.clone(), empty.clone()]);
+        let err = verify_approval_receipt(&receipt, &expected)
+            .expect_err("an empty signature beside a valid witness must refuse the receipt");
+        assert_eq!(
+            err,
+            "receipt carries a malformed witness: signature is not a string"
+        );
+
+        receipt.signatures = Some(vec![empty]);
+        let err = verify_approval_receipt(&receipt, &expected).expect_err("alone, the same");
+        assert!(
+            err.contains("malformed witness"),
+            "unexpected reason: {err}"
+        );
+
+        // A witness object with every field empty is what `{}` becomes once serde's required
+        // fields are present as empty strings: refused for the same reason, never "quorum not met".
+        receipt.signatures = Some(vec![
+            witness,
+            ApprovalWitness {
+                signer_did: None,
+                signer_public_key: String::new(),
+                signature: String::new(),
+                sig_alg: None,
+                authenticator_data: None,
+                client_data_json: None,
+            },
+        ]);
+        let err = verify_approval_receipt(&receipt, &expected).expect_err("empty witness");
+        assert!(
+            err.contains("malformed witness"),
+            "unexpected reason: {err}"
+        );
     }
 
     /// The witness list is attacker-supplied and every entry costs an ECDSA verification per
